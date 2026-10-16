@@ -1,10 +1,10 @@
 // plan-b – Anzeige und Bedienung. Einziger Teil mit DOM, Geolocation, localStorage, Timern.
 // Später: Vue-Komponenten; die Abläufe dahinter liefert dann ein NestJS-Backend.
 
-import { STOPS, OUTBOUND, RETURN, RULES, WEATHER, API } from './config.js';
+import { STOPS, OUTBOUND, RETURN, RULES, WEATHER, API, TIME } from './config.js';
 import { createTransitousClient, fetchWeather } from './api.js';
 import { resolveStops, planJourney, locateInConnection, choiceSignature } from './planner.js';
-import { nextStep, recommendationChanged, recommendationKey } from './logic.js';
+import { nextStep, recommendationChanged, recommendationKey, nextOccurrence, weatherAt } from './logic.js';
 
 const $ = (sel) => document.querySelector(sel);
 const JOURNEYS = { outbound: OUTBOUND, return: RETURN };
@@ -16,6 +16,11 @@ const store = {
   set(key, value) { try { localStorage.setItem(`plan-b:${key}`, JSON.stringify(value)); } catch { /* privat-Modus */ } },
 };
 
+/** "HH:MM" oder null */
+function validTime(v) {
+  return typeof v === 'string' && /^\d{2}:\d{2}$/.test(v) ? v : null;
+}
+
 /** Zustand der Seite */
 const state = {
   busy: false,
@@ -24,13 +29,17 @@ const state = {
   connections: [],
   results: [],
   lastBest: null, // recommendationKey der letzten Empfehlung – für "Neue Empfehlung"
+  timeMode: store.get('timeMode') ?? 'now', // 'now' | 'usual' | 'custom'
+  customTime: validTime(store.get('customTime')) ?? '07:30',
   enRoute: { active: false, start: null, mode: null, tripConnection: null, timer: null, lastRun: 0 },
 };
 
 // ---------------------------------------------------------------------------
 // Formatierung
 // ---------------------------------------------------------------------------
-const fmtTime = (t) => new Date(t).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+const fmtTime = (t) => new Date(t).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit', timeZone: TIME.timeZone });
+const fmtDay = (t) => new Date(t).toLocaleDateString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit', timeZone: TIME.timeZone });
+const fmtWhen = (t, now) => (fmtDay(t) === fmtDay(now) ? `heute ${fmtTime(t)}` : `${fmtDay(t)} ${fmtTime(t)}`);
 const fmtDur = (msDiff) => {
   const m = Math.round(msDiff / 60000);
   return m >= 60 ? `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')}` : `${m} Min.`;
@@ -58,6 +67,32 @@ function message(kind, html) {
 const clearMessages = () => { $('#messages').innerHTML = ''; };
 
 // ---------------------------------------------------------------------------
+// Abfahrtszeit: jetzt, gewohnte Zeit (nächster Werktag) oder eigene Uhrzeit
+// ---------------------------------------------------------------------------
+/** @param {'outbound'|'return'} journeyKey */
+function searchTimeFor(journeyKey, now) {
+  // Kulanz: bis 30 Min. nach der Uhrzeit gilt noch "heute" (dann ab jetzt), danach der nächste Tag
+  const graceMinutes = 30;
+  if (state.timeMode === 'usual') {
+    return nextOccurrence(now, JOURNEYS[journeyKey].usualTime, { timeZone: TIME.timeZone, weekdays: TIME.workdays, graceMinutes });
+  }
+  if (state.timeMode === 'custom') {
+    return nextOccurrence(now, state.customTime, { timeZone: TIME.timeZone, graceMinutes });
+  }
+  return now;
+}
+
+function renderTimeHint() {
+  const now = Date.now();
+  const hint = $('#time-hint');
+  $('#time-custom').hidden = state.timeMode !== 'custom';
+  if (state.timeMode === 'now') hint.textContent = 'Verbindungen ab jetzt, mit Echtzeit.';
+  else if (state.timeMode === 'usual') {
+    hint.textContent = `Zur Arbeit ${fmtWhen(searchTimeFor('outbound', now), now)} · Nach Hause ${fmtWhen(searchTimeFor('return', now), now)}`;
+  } else hint.textContent = `Ab ${fmtWhen(searchTimeFor('outbound', now), now)}`;
+}
+
+// ---------------------------------------------------------------------------
 // Hauptablauf: Abfrage starten (normal oder unterwegs)
 // ---------------------------------------------------------------------------
 /**
@@ -74,8 +109,12 @@ async function run(journeyKey, start) {
   $('#results').innerHTML = `<li class="loading"><span class="spinner"></span>Frage Verbindungen ab …</li>`;
   $('#summary').textContent = '';
 
+  renderTimeHint();
   try {
-    const now = Date.now();
+    const realNow = Date.now();
+    // Unterwegs immer ab jetzt; sonst je nach Auswahl jetzt / gewohnte Zeit / eigene Uhrzeit
+    const now = start ? realNow : searchTimeFor(journeyKey, realNow);
+    const planned = now > realNow + 30 * 60_000;
     // 1) Haltestellen auflösen (gecacht) und Wetter parallel holen
     const [stops, weather] = await Promise.all([
       resolveStops(client, STOPS, { cache: store, choices: store.get('choices') ?? {} }),
@@ -86,7 +125,7 @@ async function run(journeyKey, start) {
     ]);
     state.stops = stops;
     renderStops(stops);
-    renderWeather(weather);
+    renderWeather(weather, now, realNow);
     const unresolved = Object.values(stops).filter((s) => s.status !== 'ok');
     if (unresolved.length) {
       message('warn', `⚠️ ${unresolved.length} Haltestelle(n) nicht eindeutig gefunden: ${unresolved.map((s) => esc(s.expected)).join(', ')}.
@@ -96,18 +135,20 @@ async function run(journeyKey, start) {
 
     // 2) Alle Kombinationen parallel abfragen und gemeinsam sortieren
     const { connections, results } = await planJourney({
-      client, journey, stops, rules: RULES, now, start, weather, weatherThresholds: WEATHER.goodBikeWeather,
+      client, journey, stops, rules: RULES, now, realNow, start, weather, weatherThresholds: WEATHER.goodBikeWeather,
     });
     state.connections = connections;
     state.results = results;
 
     // 3) Unterwegs: Empfehlungswechsel deutlich anzeigen
     const best = connections.find((c) => c.best);
-    if (start && recommendationChanged(state.lastBest, best, now)) {
-      message('change', `🔀 Neue Empfehlung: ${esc(describeStep(best, now))}`);
+    if (start && recommendationChanged(state.lastBest, best, realNow)) {
+      message('change', `🔀 Neue Empfehlung: ${esc(describeStep(best, realNow))}`);
       try { navigator.vibrate?.(200); } catch { /* egal */ }
     }
-    if (best) state.lastBest = recommendationKey(best);
+    // Vergleichsbasis für "Neue Empfehlung" nur aus aktuellen (nicht geplanten) Abfragen
+    state.lastBest = best && !planned ? recommendationKey(best) : null;
+    if (planned) message('info', `🗓️ Geplante Fahrt ab ${esc(fmtWhen(now, realNow))} – Echtzeit-Verspätungen gibt es erst kurz vor Abfahrt.`);
 
     // Ungeklärte Haltestellen wurden oben schon gemeldet → hier nur echte API-Fehler
     const failed = results.filter((r) => r.status === 'error');
@@ -118,8 +159,9 @@ async function run(journeyKey, start) {
       message('warn', `Einige Varianten konnten nicht abgefragt werden: ${apiFailed.map((r) => esc(r.combo.name)).join(', ')} – ${esc(apiFailed[0].error)}`);
     }
 
-    renderResults(connections, results, !!start, now);
-    $('#summary').textContent = `${journey.label}${start ? ` · ab ${start.type === 'gps' ? 'Standort' : start.label}` : ''} · Stand ${fmtTime(now)} · ${connections.length} Verbindungen aus ${results.length} Varianten`;
+    renderResults(connections, results, !!start, realNow);
+    const from = start ? ` · ab ${start.type === 'gps' ? 'Standort' : start.label}` : ` · ab ${fmtWhen(now, realNow)}`;
+    $('#summary').textContent = `${journey.label}${from} · Stand ${fmtTime(realNow)} · ${connections.length} Verbindungen aus ${results.length} Varianten`;
     fillTripSelect();
   } catch (e) {
     $('#results').innerHTML = '';
@@ -166,7 +208,8 @@ function renderResults(connections, results, enRoute, now) {
   for (const r of results.filter((x) => x.status !== 'ok')) {
     const li = document.createElement('li');
     li.className = 'conn dim';
-    const why = r.status === 'error' ? esc(r.error) : enRoute ? 'nicht mehr erreichbar' : 'keine Verbindung gefunden';
+    let why = r.status === 'error' ? esc(r.error) : enRoute ? 'nicht mehr erreichbar' : 'keine passende Verbindung gefunden';
+    if (r.dropped?.buffer) why += ` · ${r.dropped.buffer} wegen zu knappem Umstieg (unter ${RULES.minBufferMinutes} Min. Puffer) verworfen`;
     li.innerHTML = `<div class="conn-head"><span class="variant">${esc(r.combo.name)}</span></div><p class="meta">${why}</p>`;
     list.append(li);
   }
@@ -189,8 +232,9 @@ function connectionCard(c, rank, now) {
     badges.push(`<span class="badge ${cls}">${esc(txt)}</span>`);
   }
   if (c.arrDelayMin >= 2 || c.depDelayMin >= 2) badges.push(`<span class="badge late">Verspätung ${delayText(Math.max(c.depDelayMin, c.arrDelayMin))} Min.</span>`);
-  if (c.realtime === 'none') badges.push('<span class="badge info">keine Echtzeitdaten</span>');
-  else if (c.realtime === 'partial') badges.push('<span class="badge info">Echtzeit nur teilweise</span>');
+  const soon = c.departure < now + 60 * 60_000; // Echtzeit gibt es erst kurz vor Abfahrt
+  if (c.realtime === 'none' && soon) badges.push('<span class="badge info">keine Echtzeitdaten</span>');
+  else if (c.realtime === 'partial' && soon) badges.push('<span class="badge info">Echtzeit nur teilweise</span>');
   if (c.estimated) badges.push('<span class="badge info">Ankunft geschätzt</span>');
   if (c.usesBike) {
     const w = c.weather;
@@ -220,29 +264,31 @@ function connectionCard(c, rank, now) {
     <div class="badges">${badges.join('')}</div>
     <details>
       <summary>Verlauf &amp; Umstiege</summary>
-      <ul class="legs">${legsHtml(c)}</ul>
+      <ul class="legs">${legsHtml(c, now)}</ul>
     </details>`;
   return li;
 }
 
-function legsHtml(c) {
+function legsHtml(c, now) {
   const out = [];
-  let transitIdx = 0;
-  const transitCount = c.legs.filter((l) => l.kind === 'transit').length;
+  let riskIdx = 0;
+  let seenTransit = false;
   for (const l of c.legs) {
     if (l.kind === 'transit') {
-      const late = l.delayStartMin !== 0 ? ` <span class="late">${delayText(l.delayStartMin)}</span>` : '';
-      const lateEnd = l.delayEndMin !== 0 ? ` <span class="late">${delayText(l.delayEndMin)}</span>` : '';
-      out.push(`<li class="leg"><span class="lt">${fmtTime(l.start)}</span><span>${modeIcon(l)}</span>
-        <span class="ld"><span class="line">${esc(l.line)}</span>${esc(l.fromName)}${late}
-        <small>${l.headsign ? `Richtung ${esc(l.headsign)} · ` : ''}an ${esc(l.toName)} ${fmtTime(l.end)}${lateEnd}${l.realTime ? '' : ' · ohne Echtzeit'}${l.cancelled ? ' · <b>fällt aus</b>' : ''}</small></span></li>`);
-      // Umstiegs-Puffer nach diesem Leg
-      const risk = transitIdx < transitCount - 1 ? c.risks[transitIdx] : null;
+      // Umstieg (Zeit, Fußweg, Puffer) direkt vor der Anschlussfahrt; sitzen bleiben ist kein Umstieg
+      const risk = seenTransit && !l.interline ? c.risks[riskIdx++] : null;
       if (risk) {
         const cls = risk.level === 'missed' ? 'missed' : risk.level === 'tight' ? (risk.critical ? 'critical' : 'tight') : '';
-        out.push(`<li class="xfer ${cls}">↳ Umstieg ${esc(risk.atName)}: ${risk.bufferMin} Min. Puffer${risk.critical ? ' · Anschluss stündlich' : ''}</li>`);
+        const walk = risk.walkMin > 0 ? ` (${risk.walkMin} Min. Fußweg)` : '';
+        out.push(`<li class="xfer ${cls}">↳ Umstieg ${esc(risk.atName)}: ${risk.transferMin} Min.${walk} · ${risk.bufferMin} Min. Puffer${risk.critical ? ' · Bus stündlich' : ''}</li>`);
       }
-      transitIdx++;
+      seenTransit = true;
+      const late = l.delayStartMin !== 0 ? ` <span class="late">${delayText(l.delayStartMin)}</span>` : '';
+      const lateEnd = l.delayEndMin !== 0 ? ` <span class="late">${delayText(l.delayEndMin)}</span>` : '';
+      const noRt = !l.realTime && l.start < now + 60 * 60_000 ? ' · ohne Echtzeit' : ''; // bei geplanten Fahrten normal
+      out.push(`<li class="leg"><span class="lt">${fmtTime(l.start)}</span><span>${modeIcon(l)}</span>
+        <span class="ld"><span class="line">${esc(l.line)}</span>${esc(l.fromName)}${late}
+        <small>${l.headsign ? `Richtung ${esc(l.headsign)} · ` : ''}an ${esc(l.toName)} ${fmtTime(l.end)}${lateEnd}${noRt}${l.cancelled ? ' · <b>fällt aus</b>' : ''}</small></span></li>`);
     } else if (l.label) {
       out.push(`<li class="leg"><span class="lt">${fmtTime(l.start)}</span><span>${modeIcon(l)}</span><span class="ld">${esc(l.label)}<small>bis ${fmtTime(l.end)}</small></span></li>`);
     } else if (l.end - l.start >= 60_000) {
@@ -252,16 +298,15 @@ function legsHtml(c) {
   return out.join('');
 }
 
-function renderWeather(w) {
+function renderWeather(w, time, realNow) {
   const el = $('#weather');
-  if (!w) { el.innerHTML = ''; return; }
-  const t = WEATHER.goodBikeWeather;
-  const c = w.current;
-  const good = c.precipitation < t.maxPrecipitationMm && c.temperature > t.minTemperatureC && c.wind < t.maxWindKmh;
+  const c = weatherAt(w, time, WEATHER.goodBikeWeather);
+  if (!c) { el.innerHTML = ''; return; }
+  const when = time > realNow + 60 * 60_000 ? `Vorhersage ${fmtWhen(time, realNow)}` : 'jetzt';
   el.innerHTML = `<div class="weather card">
-    <span class="badge ${good ? 'good' : 'bad'}">${good ? '🚲 Gutes Fahrradwetter' : '🌧️ Kein Fahrradwetter'}</span>
+    <span class="badge ${c.good ? 'good' : 'bad'}">${c.good ? '🚲 Gutes Fahrradwetter' : `🌧️ Kein Fahrradwetter (${esc(c.reasons.join(', '))})`}</span>
     <span>🌡️ ${Math.round(c.temperature)} °C</span><span>💧 ${c.precipitation.toFixed(1)} mm</span><span>💨 ${Math.round(c.wind)} km/h</span>
-    <span class="meta">jetzt, Linkenheim-Hochstetten</span></div>`;
+    <span class="meta">${when}, Linkenheim-Hochstetten</span></div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +381,8 @@ function setEnRoute(active) {
 function fillTripSelect() {
   const sel = $('#sel-trip');
   const now = Date.now();
-  const options = state.connections.filter((c) => c.legs.some((l) => l.kind === 'transit' && l.end > now));
+  // Nur Verbindungen, die gerade laufen oder in den nächsten 30 Min. starten (nicht die geplanten von morgen)
+  const options = state.connections.filter((c) => c.legs.some((l) => l.kind === 'transit' && l.end > now && l.start <= now + 30 * 60_000));
   sel.innerHTML = options.length
     ? '<option value="">– Verbindung wählen –</option>' + options.map((c) => {
       const t = c.legs.filter((l) => l.kind === 'transit').map((l) => l.line).join(' → ');
@@ -428,3 +474,20 @@ $('#btn-trip').addEventListener('click', () => {
   if (conn) planFromTrip(conn);
 });
 $('#chk-auto').addEventListener('change', (e) => (e.target.checked ? startAuto() : stopAuto()));
+
+// Zeitwahl (Auswahl wird im Browser gemerkt)
+document.querySelectorAll('input[name="tmode"]').forEach((r) => {
+  r.checked = r.value === state.timeMode;
+  r.addEventListener('change', () => { state.timeMode = r.value; store.set('timeMode', r.value); renderTimeHint(); });
+});
+$('#time-custom').value = state.customTime;
+$('#time-custom').addEventListener('change', (e) => {
+  const v = validTime(e.target.value);
+  if (!v) { e.target.value = state.customTime; return; } // leeres Feld nicht übernehmen
+  state.customTime = v;
+  store.set('customTime', v);
+  renderTimeHint();
+});
+renderTimeHint();
+setInterval(() => { if (document.visibilityState === 'visible') renderTimeHint(); }, 60_000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') renderTimeHint(); });

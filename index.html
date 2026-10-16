@@ -21,6 +21,17 @@
       <button class="primary" id="btn-return" type="button">🏠 Nach Hause</button>
     </section>
 
+    <section class="when" aria-label="Abfahrtszeit">
+      <span class="label">Abfahrt</span>
+      <div class="seg" role="radiogroup">
+        <label><input type="radio" name="tmode" value="now" checked> Jetzt</label>
+        <label><input type="radio" name="tmode" value="usual"> Gewohnt</label>
+        <label><input type="radio" name="tmode" value="custom"> Uhrzeit</label>
+      </div>
+      <input type="time" id="time-custom" value="07:30" aria-label="Eigene Abfahrtszeit" hidden>
+      <p class="hint" id="time-hint"></p>
+    </section>
+
     <section class="enroute card" id="enroute" aria-labelledby="enroute-title">
       <div class="enroute-head">
         <h2 id="enroute-title">Unterwegs</h2>

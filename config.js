@@ -20,6 +20,7 @@ export const STOPS = {
   // Setzt du id: null, sucht die App die Haltestelle wieder selbst über name + place.
   home:             { name: 'Hochstetten Waldstraße', place: 'Linkenheim-Hochstetten', id: 'de-KVV_Pde:08215:7702', lat: 49.13485, lon: 8.4224 },
   grabenNeudorf:    { name: 'Graben-Neudorf', place: 'Graben-Neudorf', query: 'Graben-Neudorf Bahnhof', rail: true, id: 'de-DELFI_de:08215:32585', lat: 49.16207, lon: 8.49069 },
+  // Bruchsal Hauptbahnhof (in den Fahrplandaten nur "Bruchsal"; ICE, RE, S3, S33)
   bruchsal:         { name: 'Bruchsal', place: 'Bruchsal', rail: true, id: 'de-DELFI_de:08215:1856', lat: 49.12462, lon: 8.58965 },
   wieslochWalldorf: { name: 'Wiesloch-Walldorf', place: 'Wiesloch', query: 'Wiesloch-Walldorf Bahnhof', rail: true, id: 'de-DELFI_de:08226:4252_G', lat: 49.29135, lon: 8.66415 },
   neulussheim:      { name: 'Neulußheim', place: 'Neulußheim', rail: true, id: 'de-DELFI_de:08226:3101', lat: 49.29295, lon: 8.53067 },
@@ -53,12 +54,16 @@ const WORK = ['workIndustrie', 'workHdm'];
  * @property {FixedPart} [fixedAfter]       Fester Anteil NACH der ÖPNV-Fahrt
  * @property {string[]} [busTransferAt]  Hier MUSS zwischen Bus und Bahn umgestiegen werden (sonst wird die
  *                                        Verbindung verworfen). Der Bus fährt nur 1x pro Stunde → Umstieg ist kritisch.
+ * @property {Record<string, number|{minutes: number, towards?: string}>} [minBufferAt]
+ *           Ausnahme vom Mindestpuffer an einem Halt, optional nur in eine Richtung,
+ *           z. B. { bruchsal: { minutes: 2, towards: 'grabenNeudorf' } }
  * @property {{to: string, minutes: number, label: string}} [fallback]
  *           Liefert die API zum Ziel nichts: bis fallback.to suchen und minutes als Schätzung aufschlagen.
  *
  * @typedef {Object} Journey
  * @property {string} key
  * @property {string} label
+ * @property {string} usualTime   Gewohnte Abfahrt "HH:MM" (Auswahl "Gewohnt" in der App)
  * @property {StageOption[]} stage1
  * @property {StageOption[]} stage2
  */
@@ -67,6 +72,7 @@ const WORK = ['workIndustrie', 'workHdm'];
 export const OUTBOUND = {
   key: 'outbound',
   label: 'Zur Arbeit',
+  usualTime: '07:30', // von daheim los
   stage1: [
     { key: 'bus', name: 'Bus', from: ['home'], via: ['grabenNeudorf'] },
     {
@@ -90,6 +96,7 @@ export const OUTBOUND = {
 export const RETURN = {
   key: 'return',
   label: 'Nach Hause',
+  usualTime: '17:00', // von der Arbeit los
   stage1: [
     { key: 'A1', name: 'Bus + S9 über Neulußheim', from: WORK, via: ['neulussheim'], busTransferAt: ['neulussheim'] },
     { key: 'A2', name: 'Bus + S9 über Hockenheim', from: WORK, via: ['hockenheim'], busTransferAt: ['hockenheim'] },
@@ -97,6 +104,7 @@ export const RETURN = {
     {
       key: 'B', name: 'Fußweg + S-Bahn über Wiesloch-Walldorf/Bruchsal',
       from: ['wieslochWalldorf'], via: ['bruchsal'],
+      minBufferAt: { bruchsal: { minutes: 2, towards: 'grabenNeudorf' } }, // Ausnahme: Bruchsal → Graben-Neudorf reichen 2 Min.
       fixedBefore: { minutes: 25, mode: 'walk', label: 'Zu Fuß zum Bahnhof Wiesloch-Walldorf (25 Min.)' },
     },
   ],
@@ -111,12 +119,20 @@ export const RETURN = {
 
 /** Umstiegs- und Abfrage-Parameter */
 export const RULES = {
-  tightTransferMinutes: 5, // Puffer darunter = "knapp"
+  minBufferMinutes: 3, // Umstiege mit weniger Puffer (laut Fahrplan) nie nutzen – Ausnahmen: minBufferAt
+  tightTransferMinutes: 5, // Puffer darunter = "knapp" (inkl. Echtzeit)
   viaMinimumStayMinutes: 1, // erzwingt Aussteigen am Via-Halt (bei 0 zählt auch Durchfahren)
-  connectionsPerVariant: 3, // nächste N Verbindungen je Kombination
+  connectionsPerVariant: 3, // nächste N Verbindungen je Kombination (Anzeige)
+  itinerariesPerQuery: 5, // so viele je Abfrage holen – einige fallen durch die Umstiegsregeln weg
   maxParallelRequests: 4, // schont die Transitous-API
   autoRefreshMinutes: 3, // Unterwegs-Modus
   maxPreTransitSecondsFromGps: 1800, // max. Fußweg vom GPS-Standort zur ersten Haltestelle
+};
+
+/** Zeitzone und Arbeitstage für die "gewohnten" Abfahrtszeiten */
+export const TIME = {
+  timeZone: 'Europe/Berlin',
+  workdays: [1, 2, 3, 4, 5], // 0 = Sonntag … 6 = Samstag
 };
 
 /** Wetter (Open-Meteo) für Linkenheim-Hochstetten */

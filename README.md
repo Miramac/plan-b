@@ -27,6 +27,12 @@ Für GPS (Unterwegs-Modus) muss die Seite über HTTPS (oder localhost) laufen.
 | `ui.js`, `index.html`, `style.css` | Anzeige und Bedienung, Geolocation, Auto-Update, localStorage |
 | `test/` | Node-Tests mit Fake-API |
 
+## Bedienung
+
+- **Zur Arbeit / Nach Hause:** fragt alle Varianten der Richtung ab.
+- **Abfahrt:** *Jetzt* (mit Echtzeit), *Gewohnt* (nächster Werktag 7:30 bzw. 17:00, in `config.js` → `usualTime`) oder eigene *Uhrzeit*.
+- **Unterwegs:** neu planen ab GPS-Standort oder ab der Fahrt, in der du sitzt; optional Auto-Update alle 3 Minuten.
+
 ## So funktioniert der Vergleich
 
 1. **Kombinationen:** Jede Option aus Etappe 1 wird mit jeder Option aus Etappe 2 kombiniert (Hinweg: Bus/Rad × A1/A2/A3/B = 8).
@@ -42,6 +48,13 @@ Die Transitous-IDs sind fest in `config.js → STOPS` eingetragen, ermittelt per
 
 - **Via-Halte:** Ohne Mindestaufenthalt zählt auch ein Zug, der nur durchfährt. Deshalb setzt die App `viaMinimumStay = 1` (`RULES.viaMinimumStayMinutes`) und erzwingt so das Aussteigen.
 - **Varianten A1–A3:** Zusätzlich prüft die App, dass am Bahnhof wirklich zwischen Bus und Bahn umgestiegen wird (`busTransferAt`). Sonst wird die Verbindung verworfen.
+- **Umstiegsregel:** Umstiege mit weniger als 3 Min. Puffer (Umstiegszeit minus Fußweg, laut Fahrplan) werden nie genutzt. Ausnahme: Bruchsal → Graben-Neudorf mit 2 Min. (`RULES.minBufferMinutes`, `minBufferAt` mit `towards`). Umsetzung:
+  - `additionalTransferTime` lässt den Router nur Umstiege mit genug Luft planen. So findet er auch „gleicher Zug, nächster Bus“, statt nur die zu knappe Verbindung zu liefern.
+  - An Via-Halten addiert MOTIS den Mindestaufenthalt dazu, deshalb gilt dort Reserve = Mindestpuffer − 1.
+  - MOTIS rechnet die Reserve in die Fußwege ein; die App zieht sie für die Anzeige wieder ab.
+  - Fällt trotzdem etwas wegen zu knapper Umstiege weg (Umstieg außerhalb der Via-Halte), folgt eine zweite Abfrage mit voller Reserve.
+- **Verspätungen:** Bei „Jetzt“ und unterwegs fragt die App zusätzlich mit `realtimeMode=REALTIME_ANNOTATION_ONLY` ab (Routing nach Fahrplan, Echtzeit nur als Info). Eine Verspätung lässt eine Verbindung so nicht verschwinden, sondern markiert sie als „knapp“.
+- **Unterwegs:** Auch der Umstieg am nächsten Halt der aktuellen Fahrt wird gegen den Mindestpuffer geprüft; sitzen bleiben ist immer erlaubt.
 - **Echtzeit:** Gibt es erst kurz vor der Fahrt. Abfragen für spätere Tage zeigen daher „keine Echtzeitdaten“.
 
 ## Nutzungsregeln Transitous

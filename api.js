@@ -51,9 +51,16 @@ async function getJson(fetchImpl, url, serviceName, timeoutMs = 20_000) {
   }
   if (!res.ok) {
     let detail = '';
-    try { detail = (await res.text()).slice(0, 200); } catch { /* egal */ }
-    const hint = res.status === 429 ? ' (zu viele Anfragen – bitte kurz warten)' : '';
-    throw new ApiError(`${serviceName}: Fehler ${res.status}${hint}${detail ? ` – ${detail}` : ''}`, { status: res.status, url });
+    try {
+      const text = await res.text();
+      // Open-Meteo/MOTIS liefern oft JSON mit einer Begründung → die ist lesbarer als der Rohtext
+      try { const j = JSON.parse(text); detail = j.reason ?? j.error ?? j.message ?? text; } catch { detail = text; }
+      detail = String(detail).slice(0, 200);
+    } catch { /* egal */ }
+    const msg = res.status === 429
+      ? `${serviceName}: Anfragelimit erreicht – bitte später erneut versuchen.`
+      : `${serviceName}: Fehler ${res.status}${detail ? ` – ${detail}` : ''}`;
+    throw new ApiError(msg, { status: res.status, url });
   }
   return res.json();
 }
@@ -84,7 +91,9 @@ export function createTransitousClient({ baseUrl, maxParallel = 4, fetchImpl = g
      * Verbindungssuche. fromPlace/toPlace = Stop-ID oder "lat,lon".
      * via: max. 2 Stop-IDs, die die Verbindung passieren muss (MOTIS-Feature).
      * viaMinimumStay: Mindestaufenthalt je Via-Halt in Minuten (0 = Durchfahren reicht, ≥1 = aussteigen).
-     * @param {PlanQuery & {numItineraries?: number, viaMinimumStay?: number[]}} q
+     * additionalTransferTime: Reserve je Umstieg in Minuten (MOTIS verlängert damit die Umstiegs-Fußwege).
+     * realtimeMode: 'REALTIME' (Standard) oder 'REALTIME_ANNOTATION_ONLY' (Routing nach Fahrplan, Echtzeit nur als Info).
+     * @param {PlanQuery & {numItineraries?: number, viaMinimumStay?: number[], additionalTransferTime?: number, realtimeMode?: string}} q
      * @returns {Promise<{itineraries: any[]}>}
      */
     plan(q) {
@@ -96,6 +105,8 @@ export function createTransitousClient({ baseUrl, maxParallel = 4, fetchImpl = g
         time: new Date(q.time).toISOString(),
         numItineraries: q.numItineraries ?? 3,
         maxPreTransitTime: q.maxPreTransitTime,
+        additionalTransferTime: q.additionalTransferTime,
+        realtimeMode: q.realtimeMode,
         detailedTransfers: false,
         language: 'de',
       });
@@ -121,7 +132,7 @@ export async function fetchWeather({ baseUrl, lat, lon, fetchImpl = globalThis.f
   const vars = 'temperature_2m,precipitation,wind_speed_10m';
   const url = `${baseUrl}/v1/forecast?${qs({
     latitude: lat, longitude: lon, current: vars, hourly: vars,
-    timeformat: 'unixtime', timezone: 'GMT', forecast_days: 2, wind_speed_unit: 'kmh',
+    timeformat: 'unixtime', timezone: 'GMT', forecast_days: 7, wind_speed_unit: 'kmh',
   })}`;
   const d = await getJson(fetchImpl, url, 'Open-Meteo');
   const point = (time, i, src) => ({

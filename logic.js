@@ -36,6 +36,7 @@
  * @property {FixedPart|null} fixedBefore
  * @property {FixedPart|null} fixedAfter
  * @property {string[]} busTransferAt
+ * @property {Record<string, number|{minutes: number, towards?: string}>} minBufferAt  Ausnahmen vom Mindestpuffer je Halt
  * @property {{to:string, minutes:number, label:string}|null} fallback
  * @property {boolean} usesBike
  */
@@ -70,12 +71,15 @@
  * @property {string} [fromStopId]
  * @property {string} [toStopId]
  * @property {string} [label]
+ * @property {boolean} [interline]  gleiches Fahrzeug wie das vorige Leg (sitzen bleiben, kein Umstieg)
  */
 
 /**
  * @typedef {Object} TransferRisk
  * @property {string} atName
- * @property {number} bufferMin   Puffer in Minuten (inkl. Echtzeit, abzüglich Fußweg)
+ * @property {number} transferMin Umstiegszeit: Abfahrt − Ankunft (inkl. Echtzeit)
+ * @property {number} walkMin     davon Fußweg laut Router
+ * @property {number} bufferMin   Puffer = Umstiegszeit − Fußweg (inkl. Echtzeit)
  * @property {'ok'|'tight'|'missed'} level
  * @property {boolean} critical   Anschluss fährt nur stündlich
  * @property {string} nextLine
@@ -241,6 +245,7 @@ export function buildCombinations(journey) {
         fixedBefore: s1.fixedBefore ?? s2.fixedBefore ?? null,
         fixedAfter: s2.fixedAfter ?? s1.fixedAfter ?? null,
         busTransferAt: [...(s1.busTransferAt ?? []), ...(s2.busTransferAt ?? [])],
+        minBufferAt: { ...(s1.minBufferAt ?? {}), ...(s2.minBufferAt ?? {}) },
         fallback: s2.fallback ?? s1.fallback ?? null,
         usesBike: [s1.fixedBefore, s2.fixedBefore, s1.fixedAfter, s2.fixedAfter].some((f) => f?.mode === 'bike'),
       });
@@ -270,7 +275,7 @@ export function combinationsEnRoute(combos, isPassed) {
       fixedBefore: null,
       usesBike: c.fixedAfter?.mode === 'bike',
     };
-    const sig = JSON.stringify([adapted.via, adapted.to, adapted.fixedAfter, adapted.fallback, adapted.busTransferAt]);
+    const sig = JSON.stringify([adapted.via, adapted.to, adapted.fixedAfter, adapted.fallback, adapted.busTransferAt, adapted.minBufferAt]);
     if (!groups.has(sig)) groups.set(sig, []);
     groups.get(sig).push(adapted);
   }
@@ -349,22 +354,40 @@ export const isTransitMode = (mode) => !NON_TRANSIT.has(mode);
  * @param {number} notBefore    frühestmögliche Abfahrt
  */
 export function mergeItineraries(itineraries, limit, notBefore = 0) {
-  const byFirstTrip = new Map();
+  // Gruppieren nach erster Fahrt (z. B. derselbe Zug, danach Bus zur Industriestraße bzw. zum HDM,
+  // oder dieselbe Verbindung aus mehreren Abfragen). Je Gruppe die früheste Ankunft behalten.
+  // Ist die laut Echtzeit nicht mehr zu schaffen, zusätzlich die beste machbare Alternative.
+  const groups = new Map();
   for (const it of itineraries) {
-    const first = (it.legs ?? []).find((l) => isTransitMode(l.mode));
-    if (!first) continue; // reine Fußwege ignorieren
-    if (ms(first.startTime) < notBefore - MIN) continue;
-    // Gleiche Fahrt ab zwei Arbeits-Haltestellen = eine Verbindung. Behalten: frühere Ankunft,
-    // bei Gleichstand spätere Abfahrt (weniger Warten/Laufen).
-    const key = first.tripId ?? `${first.routeShortName}@${first.scheduledStartTime}`;
-    const prev = byFirstTrip.get(key);
-    const better = !prev || ms(it.endTime) < ms(prev.endTime) ||
-      (ms(it.endTime) === ms(prev.endTime) && ms(it.startTime) > ms(prev.startTime));
-    if (better) byFirstTrip.set(key, it);
+    const transit = (it.legs ?? []).filter((l) => isTransitMode(l.mode));
+    if (!transit.length) continue; // reine Fußwege ignorieren
+    if (ms(transit[0].startTime) < notBefore - MIN) continue;
+    const key = transit[0].tripId ?? `${transit[0].routeShortName}@${transit[0].scheduledStartTime}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(it);
   }
-  return [...byFirstTrip.values()]
-    .sort((a, b) => firstTransitStart(a) - firstTransitStart(b))
+  const out = [];
+  for (const group of groups.values()) {
+    group.sort((a, b) => ms(a.endTime) - ms(b.endTime) || ms(b.startTime) - ms(a.startTime));
+    out.push(group[0]);
+    if (hasMissedTransfer(group[0])) {
+      const alt = group.find((it) => !hasMissedTransfer(it));
+      if (alt) out.push(alt);
+    }
+  }
+  return out
+    .sort((a, b) => firstTransitStart(a) - firstTransitStart(b) || ms(a.endTime) - ms(b.endTime))
     .slice(0, limit);
+}
+
+/** Ist ein Umstieg laut Echtzeit nicht mehr zu schaffen (Anschluss fährt vor Ankunft + Fußweg)? */
+function hasMissedTransfer(it) {
+  return transfersOf((it.legs ?? []).map(toDisplayLeg)).some(({ prev, next, walkMs }) => next.start - prev.end - walkMs < 0);
+}
+
+/** Schlüssel einer Verbindung zum Zählen/Entdoppeln (Fahrtenfolge). */
+export function itineraryKey(it) {
+  return (it.legs ?? []).filter((l) => isTransitMode(l.mode)).map((l) => l.tripId ?? l.routeShortName).join('>');
 }
 
 function firstTransitStart(it) {
@@ -394,6 +417,7 @@ export function toDisplayLeg(l) {
     realTime: !!l.realTime,
     cancelled: !!(l.cancelled || l.from?.cancelled || l.to?.cancelled),
     tripId: l.tripId,
+    interline: !!l.interlineWithPreviousLeg,
   };
 }
 
@@ -423,32 +447,136 @@ export function placeMatchesStop(place, stop) {
  * @returns {TransferRisk[]}
  */
 export function analyzeTransfers(legs, criticalStops, tightMinutes) {
-  const risks = [];
+  return transfersOf(legs).map(({ prev, next, walkMs }) => {
+    const transferMin = Math.floor((next.start - prev.end) / MIN);
+    const walkMin = Math.ceil(walkMs / MIN);
+    const bufferMin = Math.floor((next.start - prev.end - walkMs) / MIN);
+    const critical = criticalStops.some((s) => transferIsAt(prev, next, s));
+    return {
+      atName: prev.toName,
+      transferMin,
+      walkMin,
+      bufferMin,
+      level: bufferMin < 0 ? 'missed' : bufferMin < tightMinutes ? 'tight' : 'ok',
+      critical,
+      nextLine: next.line,
+    };
+  });
+}
+
+/**
+ * Alle Umstiege einer Verbindung: je zwei aufeinanderfolgende ÖPNV-Legs plus Fußweg dazwischen.
+ * @param {DisplayLeg[]} legs
+ * @returns {Array<{prev: DisplayLeg, next: DisplayLeg, walkMs: number, walkScheduledMs: number}>}
+ */
+function transfersOf(legs) {
+  const out = [];
   let prev = null;
   let walkMs = 0;
+  let walkScheduledMs = 0;
   for (const leg of legs) {
     if (leg.kind !== 'transit') {
-      if (prev) walkMs += leg.end - leg.start;
+      if (prev) {
+        walkMs += leg.end - leg.start;
+        walkScheduledMs += leg.scheduledEnd - leg.scheduledStart;
+      }
       continue;
     }
-    if (prev) {
-      const bufferMin = Math.floor((leg.start - prev.end - walkMs) / MIN);
-      const critical = criticalStops.some(
-        (s) => placeMatchesStop({ name: prev.toName, stopId: prev.toStopId }, s) ||
-               placeMatchesStop({ name: leg.fromName, stopId: leg.fromStopId }, s),
-      );
-      risks.push({
-        atName: prev.toName,
-        bufferMin,
-        level: bufferMin < 0 ? 'missed' : bufferMin < tightMinutes ? 'tight' : 'ok',
-        critical,
-        nextLine: leg.line,
-      });
-    }
+    if (prev && !leg.interline) out.push({ prev, next: leg, walkMs, walkScheduledMs });
     prev = leg;
     walkMs = 0;
+    walkScheduledMs = 0;
   }
-  return risks;
+  return out;
+}
+
+/** Findet der Umstieg prev → next an dieser Haltestelle statt? */
+function transferIsAt(prev, next, stop) {
+  return placeMatchesStop({ name: prev.toName, stopId: prev.toStopId }, stop) ||
+    placeMatchesStop({ name: next.fromName, stopId: next.fromStopId }, stop);
+}
+
+/**
+ * Die Abfrage reserviert per additionalTransferTime Puffer an jedem Umstieg (so findet der Router
+ * Alternativen statt zu knapper Anschlüsse). MOTIS rechnet diese Reserve in die Fußweg-Legs ein –
+ * hier wird sie wieder abgezogen, damit Fußweg und Puffer in der Anzeige stimmen.
+ * @param {any} it          MOTIS-Itinerary
+ * @param {number} reserveMin  verwendete additionalTransferTime in Minuten
+ * @returns {any} neues Itinerary (Original bleibt unverändert)
+ */
+export function withoutTransferReserve(it, reserveMin) {
+  if (!reserveMin) return it;
+  const legs = it.legs ?? [];
+  const transitIdx = legs.map((l, i) => (isTransitMode(l.mode) ? i : -1)).filter((i) => i >= 0);
+  const [first, last] = [transitIdx[0], transitIdx[transitIdx.length - 1]];
+  const shift = (iso, sec) => (iso ? new Date(Date.parse(iso) - sec * 1000).toISOString() : iso);
+  return {
+    ...it,
+    legs: legs.map((l, i) => {
+      if (isTransitMode(l.mode) || !(i > first && i < last)) return l; // nur Umstiegs-Fußwege
+      const cut = Math.min(reserveMin * 60, Math.max(0, (l.duration ?? 0)));
+      return { ...l, duration: (l.duration ?? 0) - cut, endTime: shift(l.endTime, cut), scheduledEndTime: shift(l.scheduledEndTime, cut) };
+    }),
+  };
+}
+
+/**
+ * Regel "zu knappe Umstiege nie nutzen": Jeder Umstieg braucht laut FAHRPLAN mindestens
+ * rules.minBufferMinutes Puffer (Umstiegszeit − Fußweg). Ausnahmen je Halt über combo.minBufferAt
+ * (z. B. Bruchsal → Graben-Neudorf: 2 Min.). Echtzeit-Verspätungen führen nicht zum Verwerfen,
+ * sondern nur zur Markierung "knapp" (siehe analyzeTransfers).
+ *
+ * @param {any} it  MOTIS-Itinerary
+ * @param {Combination} combo
+ * @param {Record<string, ResolvedStop>} stops
+ * @param {{minBufferMinutes: number}} rules
+ * @returns {boolean}
+ */
+export function meetsMinBuffer(it, combo, stops, rules) {
+  const legs = (it.legs ?? []).map(toDisplayLeg);
+  return transfersOf(legs).every(({ prev, next, walkScheduledMs }) => {
+    const planned = Math.floor((next.scheduledStart - prev.scheduledEnd - walkScheduledMs) / MIN);
+    return planned >= requiredBuffer(prev, next, combo, stops, rules);
+  });
+}
+
+/**
+ * Mindestpuffer für einen Umstieg prev → next: Standard aus RULES oder Ausnahme aus combo.minBufferAt.
+ * Eine Ausnahme mit "towards" gilt nur, wenn die Weiterfahrt dorthin führt (Bruchsal → Graben-Neudorf).
+ */
+export function requiredBuffer(prev, next, combo, stops, rules) {
+  for (const [key, rule] of Object.entries(combo.minBufferAt ?? {})) {
+    const { minutes, towards } = typeof rule === 'number' ? { minutes: rule } : rule;
+    if (!stops[key] || !transferIsAt(prev, next, stops[key])) continue;
+    if (towards && !placeMatchesStop({ name: next.toName, stopId: next.toStopId }, stops[towards])) continue;
+    return minutes;
+  }
+  return rules.minBufferMinutes;
+}
+
+/** Kleinste Puffer-Ausnahme der Kombination (für die Router-Reserve). */
+export function exceptionMinutes(combo) {
+  return Object.values(combo.minBufferAt ?? {}).map((r) => (typeof r === 'number' ? r : r.minutes));
+}
+
+/**
+ * Unterwegs ab dem nächsten Halt meiner Fahrt: Der Umstieg DORT sieht der Router nicht als Umstieg
+ * (die Suche beginnt ja an diesem Halt). Deshalb hier prüfen: sitzen bleiben ist immer ok,
+ * sonst braucht auch dieser Umstieg den Mindestpuffer laut Fahrplan.
+ * @param {any} it
+ * @param {{place: {stopId: string, name: string}, tripId?: string, arrivalScheduled?: number}} start
+ */
+export function meetsStartBuffer(it, start, combo, stops, rules) {
+  if (!start?.arrivalScheduled) return true;
+  const legs = (it.legs ?? []).map(toDisplayLeg);
+  const idx = legs.findIndex((l) => l.kind === 'transit');
+  if (idx < 0) return true;
+  const first = legs[idx];
+  if (start.tripId && first.tripId === start.tripId) return true; // sitzen bleiben
+  const walk = legs.slice(0, idx).reduce((sum, l) => sum + (l.scheduledEnd - l.scheduledStart), 0);
+  const planned = Math.floor((first.scheduledStart - start.arrivalScheduled - walk) / MIN);
+  const arrivingLeg = { toName: start.place.name, toStopId: start.place.stopId };
+  return planned >= requiredBuffer(arrivingLeg, first, combo, stops, rules);
 }
 
 /** Gesamtrisiko einer Verbindung */
@@ -616,7 +744,10 @@ export function weatherAt(data, time, t) {
   if (!data) return null;
   // Open-Meteo-Stundenwerte gelten für die Stunde VOR dem Zeitstempel → aufrunden.
   const hour = Math.ceil(time / 3_600_000) * 3_600_000;
-  const p = data.hourly.find((h) => h.time === hour) ?? data.current;
+  // Ohne passende Vorhersage-Stunde nur dann die aktuellen Werte nehmen, wenn die Fahrt bald ist
+  const p = data.hourly.find((h) => h.time === hour) ??
+    (Math.abs(time - data.current.time) < 90 * MIN ? data.current : null);
+  if (!p) return null;
   const reasons = [];
   if (!(p.precipitation < t.maxPrecipitationMm)) reasons.push('Regen');
   if (!(p.temperature > t.minTemperatureC)) reasons.push('kalt');
@@ -694,4 +825,57 @@ export function recommendationChanged(previous, best, now) {
   if (!previous || !best) return false;
   const remaining = (list) => list.filter((t) => t.end > now).map((t) => t.tripId).join('|');
   return remaining(previous) !== remaining(recommendationKey(best));
+}
+
+// ---------------------------------------------------------------------------
+// Gewohnte Abfahrtszeiten (z. B. 7:30 zur Arbeit) – Zeitzone explizit, damit es auch auf einem Server stimmt
+// ---------------------------------------------------------------------------
+
+const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/** Datum/Uhrzeit eines Zeitpunkts in einer Zeitzone (über Intl, ohne Bibliothek). */
+export function zonedParts(time, timeZone) {
+  const f = new Intl.DateTimeFormat('en-US', {
+    timeZone, hourCycle: 'h23', weekday: 'short',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const p = Object.fromEntries(f.formatToParts(new Date(time)).map((x) => [x.type, x.value]));
+  return { y: +p.year, m: +p.month, d: +p.day, h: +p.hour, min: +p.minute, s: +p.second, weekday: WEEKDAYS.indexOf(p.weekday) };
+}
+
+/**
+ * Ortszeit (Jahr, Monat, Tag, Stunde, Minute in timeZone) → Zeitpunkt in ms.
+ * Zeitumstellung wie Temporal "compatible": doppelte Stunde (Herbst) → frühere; fehlende Stunde
+ * (Frühjahr, z. B. 02:30) → um die Lücke nach vorn (03:30).
+ */
+export function zonedTime(y, m, d, h, min, timeZone) {
+  const wanted = Date.UTC(y, m - 1, d, h, min);
+  const offsetAt = (t) => { const p = zonedParts(t, timeZone); return Date.UTC(p.y, p.m - 1, p.d, p.h, p.min, p.s) - t; };
+  const day = 86_400_000;
+  const offsets = [...new Set([offsetAt(wanted - day), offsetAt(wanted), offsetAt(wanted + day)])];
+  const valid = offsets.map((o) => wanted - o).filter((t) => t + offsetAt(t) === wanted);
+  if (valid.length) return Math.min(...valid);
+  return wanted - offsetAt(wanted - day); // Lücke: Offset VOR der Umstellung → landet dahinter
+}
+
+/**
+ * Nächster Zeitpunkt mit Uhrzeit "HH:MM" nach now, optional nur an bestimmten Wochentagen.
+ * Beispiel: Freitag 23:00, "07:30", Werktage → Montag 07:30.
+ * @param {number} now
+ * @param {string} hhmm
+ * Ist die Zeit heute erst vor weniger als graceMinutes vorbei (z. B. 7:35 bei "07:30"), wird "now"
+ * zurückgegeben – sonst bekäme man um 7:31 schon die Verbindungen von morgen.
+ * @param {{timeZone: string, weekdays?: number[], graceMinutes?: number}} opts  weekdays: 0 = Sonntag … 6 = Samstag
+ */
+export function nextOccurrence(now, hhmm, { timeZone, weekdays, graceMinutes = 0 }) {
+  const [h, min] = hhmm.split(':').map(Number);
+  const today = zonedParts(now, timeZone);
+  for (let add = 0; add < 8; add++) {
+    const day = new Date(Date.UTC(today.y, today.m - 1, today.d + add)); // reine Kalender-Rechnung
+    if (weekdays && !weekdays.includes(day.getUTCDay())) continue;
+    const t = zonedTime(day.getUTCFullYear(), day.getUTCMonth() + 1, day.getUTCDate(), h, min, timeZone);
+    if (t > now) return t;
+    if (add === 0 && now - t < graceMinutes * MIN) return now;
+  }
+  throw new Error(`Keine nächste Abfahrt für ${hhmm} gefunden`);
 }

@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import { STOPS, OUTBOUND, RETURN, RULES, WEATHER } from '../config.js';
 import {
   normalize, pickStopMatch, buildCombinations, combinationsEnRoute, analyzeTransfers,
-  weatherAt, rankConnections, fitsVariant, recommendationChanged, recommendationKey, nextStopOfTrip,
+  weatherAt, rankConnections, fitsVariant, meetsMinBuffer, nextOccurrence, withoutTransferReserve,
+  mergeItineraries, meetsStartBuffer, zonedTime, requiredBuffer, recommendationChanged, recommendationKey, nextStopOfTrip,
 } from '../logic.js';
 import { resolveStops, planJourney } from '../planner.js';
 import { createFakeClient, MATCHES } from './fake-transitous.js';
@@ -223,4 +224,153 @@ test('resolveStops: feste IDs aus config.js → kein Geocoding', async () => {
   const stops = await resolveStops(client, STOPS);
   assert.equal(calls.length, 0);
   assert.ok(Object.values(stops).every((s) => s.status === 'ok' && s.source === 'config'));
+});
+
+// --- Umstiegsregel: unter 3 Min. Puffer nie, Ausnahme Bruchsal → Graben-Neudorf (2 Min.)
+const iso = (min) => new Date(NOW + min * MIN).toISOString();
+const tleg = (mode, from, to, dep, arr) => ({
+  mode, from: { name: from.n, stopId: from.id }, to: { name: to.n, stopId: to.id },
+  startTime: iso(dep), endTime: iso(arr), scheduledStartTime: iso(dep), scheduledEndTime: iso(arr), realTime: false, tripId: `${mode}${dep}`,
+});
+const BR = { n: 'Bruchsal', id: 'de-DELFI_de:08215:1856:4:4' };
+const WW = { n: 'Wiesloch-Walldorf, Bf', id: 'ww' };
+const GN = { n: 'Graben-Neudorf Bahnhof', id: 'gn' };
+const NEUL = { n: 'Neulußheim, Bahnhof', id: 'de-DELFI_de:08226:3101:1:1' };
+const WORKSTOP = { n: 'Walldorf, Industriestr.', id: 'work' };
+const realStops = {
+  bruchsal: { key: 'bruchsal', id: 'de-DELFI_de:08215:1856', expected: 'Bruchsal', name: 'Bruchsal' },
+  neulussheim: { key: 'neulussheim', id: 'de-DELFI_de:08226:3101', expected: 'Neulußheim', name: 'Neulußheim, Bahnhof' },
+  grabenNeudorf: { key: 'grabenNeudorf', id: 'gn', expected: 'Graben-Neudorf', name: 'Graben-Neudorf Bahnhof' },
+};
+
+test('meetsMinBuffer: 2 Min. Puffer (5 Min. Umstieg − 3 Min. Fußweg) wird verworfen, 3 Min. nicht', () => {
+  const combo = buildCombinations(OUTBOUND).find((c) => c.id === 'bike+A1');
+  const it = (busDep) => ({ legs: [
+    tleg('SUBURBAN', GN, NEUL, 0, 11),
+    tleg('WALK', NEUL, NEUL, 12, 15),
+    tleg('BUS', NEUL, WORKSTOP, busDep, busDep + 23),
+  ] });
+  assert.equal(meetsMinBuffer(it(16), combo, realStops, RULES), false); // 16 − 11 − 3 = 2
+  assert.equal(meetsMinBuffer(it(17), combo, realStops, RULES), true); // 3
+});
+
+test('meetsMinBuffer: Ausnahme nur Bruchsal → Graben (Rückweg B), nicht auf dem Hinweg', () => {
+  const ret = buildCombinations(RETURN).find((c) => c.id === 'B+bus');
+  const out = buildCombinations(OUTBOUND).find((c) => c.id === 'bike+B');
+  const back = { legs: [tleg('SUBURBAN', WW, BR, 0, 15), tleg('SUBURBAN', BR, GN, 17, 30)] }; // 2 Min. in Bruchsal
+  const there = { legs: [tleg('SUBURBAN', GN, BR, 0, 13), tleg('SUBURBAN', BR, WW, 15, 30)] }; // 2 Min. in Bruchsal
+  assert.equal(meetsMinBuffer(back, ret, realStops, RULES), true);
+  assert.equal(meetsMinBuffer(there, out, realStops, RULES), false);
+  const back1 = { legs: [tleg('SUBURBAN', WW, BR, 0, 15), tleg('SUBURBAN', BR, GN, 16, 30)] }; // 1 Min. – zu knapp
+  assert.equal(meetsMinBuffer(back1, ret, realStops, RULES), false);
+});
+
+test('meetsMinBuffer: entscheidet nach Fahrplan, nicht nach Echtzeit', () => {
+  const combo = buildCombinations(OUTBOUND).find((c) => c.id === 'bike+A1');
+  const late = { legs: [
+    { ...tleg('SUBURBAN', GN, NEUL, 0, 11), endTime: iso(14) }, // 3 Min. Verspätung
+    tleg('BUS', NEUL, WORKSTOP, 16, 39),
+  ] };
+  assert.equal(meetsMinBuffer(late, combo, realStops, RULES), true); // laut Plan 5 Min. → bleibt, wird nur "knapp"
+});
+
+test('nextOccurrence: Freitagabend → Montag 7:30 (Berlin, Sommerzeit)', () => {
+  const fri = Date.parse('2026-10-16T21:30:00Z'); // Fr 23:30 MESZ
+  assert.equal(new Date(nextOccurrence(fri, '07:30', { timeZone: 'Europe/Berlin', weekdays: [1, 2, 3, 4, 5] })).toISOString(), '2026-10-19T05:30:00.000Z');
+  const monEarly = Date.parse('2026-10-19T04:00:00Z'); // Mo 06:00 → heute 17:00
+  assert.equal(new Date(nextOccurrence(monEarly, '17:00', { timeZone: 'Europe/Berlin', weekdays: [1, 2, 3, 4, 5] })).toISOString(), '2026-10-19T15:00:00.000Z');
+});
+
+test('nextOccurrence: über die Zeitumstellung (25.10.2026) hinweg', () => {
+  const fri = Date.parse('2026-10-23T18:00:00Z'); // Fr 20:00 MESZ
+  // Montag 26.10. ist schon Winterzeit (MEZ, UTC+1)
+  assert.equal(new Date(nextOccurrence(fri, '07:30', { timeZone: 'Europe/Berlin', weekdays: [1, 2, 3, 4, 5] })).toISOString(), '2026-10-26T06:30:00.000Z');
+  const sat = Date.parse('2026-10-24T20:00:00Z'); // Sa 22:00 MESZ → So 25.10. 07:30 MEZ
+  assert.equal(new Date(nextOccurrence(sat, '07:30', { timeZone: 'Europe/Berlin' })).toISOString(), '2026-10-25T06:30:00.000Z');
+});
+
+test('weatherAt: ohne Vorhersage für die Stunde und weit weg von jetzt → unbekannt', () => {
+  const data = { current: { time: NOW, temperature: 12, precipitation: 0, wind: 10 }, hourly: [] };
+  assert.equal(weatherAt(data, NOW + 3 * 24 * 60 * MIN, WEATHER.goodBikeWeather), null);
+});
+
+test('withoutTransferReserve: Reserve nur aus Umstiegs-Fußwegen herausrechnen', () => {
+  const walk = (dep, arr) => ({ ...tleg('WALK', BR, BR, dep, arr), duration: (arr - dep) * 60 });
+  const it = { legs: [walk(-5, 0), tleg('SUBURBAN', GN, BR, 0, 13), walk(14, 22), tleg('SUBURBAN', BR, WW, 30, 42), walk(42, 50)] };
+  const out = withoutTransferReserve(it, 3);
+  assert.equal(out.legs[2].duration, 5 * 60); // 8 Min. inkl. Reserve → 5 Min. Fußweg
+  assert.equal(out.legs[2].endTime, iso(19));
+  assert.equal(out.legs[0].duration, 5 * 60); // Zugang (kein Umstieg) unverändert
+  assert.equal(out.legs[4].duration, 8 * 60); // Abgang unverändert
+  assert.equal(it.legs[2].duration, 8 * 60); // Original unverändert
+});
+
+test('planJourney: Reserve = Mindestpuffer − Via-Aufenthalt, Bruchsal-Ausnahme eigene Abfrage', async () => {
+  const { client, calls } = createFakeClient();
+  const stops = await resolveStops(client, GEO_STOPS);
+  // geplante Suche (Montag) → keine Echtzeit-Zusatzabfrage
+  await planJourney({ client, journey: RETURN, stops, rules: RULES, now: NOW, realNow: NOW - 3 * 24 * 60 * MIN, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  const plans = calls.filter((c) => c.type === 'plan');
+  const stay = RULES.viaMinimumStayMinutes;
+  const fromWW = plans.filter((p) => p.fromPlace === 'de:08226:4000'); // Rückweg B+bus, B+bike
+  assert.deepEqual(fromWW.map((p) => p.additionalTransferTime).sort(), [2 - stay, 2 - stay, 3 - stay, 3 - stay]);
+  assert.ok(plans.filter((p) => p.fromPlace !== 'de:08226:4000').every((p) => p.additionalTransferTime === 3 - stay));
+  assert.ok(plans.every((p) => !p.realtimeMode));
+});
+
+test('planJourney: nahe "jetzt" zusätzlich Routing nach Fahrplan mit Echtzeit-Info', async () => {
+  const { client, calls } = createFakeClient();
+  const stops = await resolveStops(client, GEO_STOPS);
+  await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, realNow: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  const plans = calls.filter((c) => c.type === 'plan');
+  const ann = plans.filter((p) => p.realtimeMode === 'REALTIME_ANNOTATION_ONLY');
+  assert.equal(ann.length, plans.length / 2);
+});
+
+test('mergeItineraries: gleiche erste Fahrt → schnellste; ist die verpasst, bleibt die Alternative', () => {
+  const S = { n: 'Neulußheim, Bahnhof', id: 'n' };
+  const train = tleg('SUBURBAN', GN, S, 0, 11);
+  const bus = (dep, delayedArrival) => ({ legs: [
+    { ...train, endTime: iso(delayedArrival ?? 11) },
+    tleg('WALK', S, S, (delayedArrival ?? 11), (delayedArrival ?? 11) + 3),
+    { ...tleg('BUS', S, WORKSTOP, dep, dep + 20), tripId: `bus${dep}` },
+  ], startTime: iso(0), endTime: iso(dep + 20) });
+  const merged = mergeItineraries([bus(16), bus(76)], 3);
+  assert.equal(merged.length, 1); // gleiche S-Bahn → nur die schnellere
+  const late = mergeItineraries([bus(16, 15), bus(76, 15)], 3); // S-Bahn 4 Min. zu spät → Bus 16 verpasst
+  assert.equal(late.length, 2);
+});
+
+test('meetsStartBuffer: unterwegs zählt der Umstieg am nächsten Halt, sitzen bleiben ist ok', () => {
+  const combo = buildCombinations(OUTBOUND).find((c) => c.id === 'bike+A1');
+  const start = { place: { stopId: NEUL.id, name: NEUL.n }, tripId: 'S6-1', arrivalScheduled: NOW + 11 * MIN };
+  const seated = { legs: [{ ...tleg('SUBURBAN', NEUL, WORKSTOP, 12, 30), tripId: 'S6-1' }] };
+  const tight = { legs: [tleg('WALK', NEUL, NEUL, 11, 14), tleg('BUS', NEUL, WORKSTOP, 16, 39)] }; // 5 − 3 = 2
+  const ok = { legs: [tleg('WALK', NEUL, NEUL, 11, 14), tleg('BUS', NEUL, WORKSTOP, 17, 40)] }; // 3
+  assert.equal(meetsStartBuffer(seated, start, combo, realStops, RULES), true);
+  assert.equal(meetsStartBuffer(tight, start, combo, realStops, RULES), false);
+  assert.equal(meetsStartBuffer(ok, start, combo, realStops, RULES), true);
+});
+
+test('zonedTime: fehlende Stunde (29.03.2026 02:30) → 03:30 MESZ, doppelte (25.10. 02:30) → frühere', () => {
+  assert.equal(new Date(zonedTime(2026, 3, 29, 2, 30, 'Europe/Berlin')).toISOString(), '2026-03-29T01:30:00.000Z');
+  assert.equal(new Date(zonedTime(2026, 10, 25, 2, 30, 'Europe/Berlin')).toISOString(), '2026-10-25T00:30:00.000Z');
+  assert.equal(new Date(zonedTime(2026, 10, 19, 7, 30, 'Europe/Berlin')).toISOString(), '2026-10-19T05:30:00.000Z');
+});
+
+test('nextOccurrence: kurz nach der gewohnten Zeit → jetzt statt morgen', () => {
+  const mon0732 = Date.parse('2026-10-19T05:32:00Z');
+  const opts = { timeZone: 'Europe/Berlin', weekdays: [1, 2, 3, 4, 5], graceMinutes: 30 };
+  assert.equal(nextOccurrence(mon0732, '07:30', opts), mon0732);
+  const mon0815 = Date.parse('2026-10-19T06:15:00Z');
+  assert.equal(new Date(nextOccurrence(mon0815, '07:30', opts)).toISOString(), '2026-10-20T05:30:00.000Z');
+});
+
+test('requiredBuffer: Bruchsal-Ausnahme nur Richtung Graben-Neudorf', () => {
+  const combo = buildCombinations(RETURN).find((c) => c.id === 'B+bus');
+  const arr = { toName: 'Bruchsal', toStopId: 'de-DELFI_de:08215:1856:4:4' };
+  const toGN = { fromName: 'Bruchsal', fromStopId: 'de-DELFI_de:08215:1856:1:1', toName: 'Graben-Neudorf Bahnhof', toStopId: 'gn' };
+  const toKA = { fromName: 'Bruchsal', fromStopId: 'de-DELFI_de:08215:1856:3:3', toName: 'Karlsruhe Hbf', toStopId: 'ka' };
+  assert.equal(requiredBuffer(arr, toGN, combo, realStops, RULES), 2);
+  assert.equal(requiredBuffer(arr, toKA, combo, realStops, RULES), RULES.minBufferMinutes);
 });
