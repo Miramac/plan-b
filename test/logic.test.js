@@ -1,0 +1,194 @@
+// Tests für logic.js und planner.js – ohne Netzwerk (Fake-Client). Start: npm test
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+
+import { STOPS, OUTBOUND, RETURN, RULES, WEATHER } from '../config.js';
+import {
+  normalize, pickStopMatch, buildCombinations, combinationsEnRoute, analyzeTransfers,
+  weatherAt, rankConnections, recommendationChanged, recommendationKey, nextStopOfTrip,
+} from '../logic.js';
+import { resolveStops, planJourney } from '../planner.js';
+import { createFakeClient, MATCHES } from './fake-transitous.js';
+
+const MIN = 60_000;
+const NOW = Date.parse('2026-10-19T05:30:00Z');
+
+test('normalize vereinheitlicht Umlaute, ß und Straßen-Abkürzungen', () => {
+  assert.equal(normalize('Philipp-Reis-Str.'), 'philipp reis strasse');
+  assert.equal(normalize('Neulußheim'), 'neulussheim');
+  assert.equal(normalize('Waldstr'), 'waldstrasse');
+});
+
+test('pickStopMatch: Bahnhof wird eindeutig erkannt (Bus-Halt "Bahnhof" daneben zählt als derselbe)', () => {
+  const r = pickStopMatch('grabenNeudorf', STOPS.grabenNeudorf, MATCHES['Graben-Neudorf']);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.id, 'de:08215:2000');
+});
+
+test('pickStopMatch: mehrdeutig → kein Raten', () => {
+  const r = pickStopMatch('oftersheim', STOPS.oftersheim, MATCHES.Oftersheim);
+  assert.equal(r.status, 'ambiguous');
+  assert.equal(r.id, null);
+  assert.equal(r.candidates.length, 2);
+});
+
+test('pickStopMatch: Name mit abgekürzter Straße und Ort im Namen', () => {
+  const r = pickStopMatch('workHdm', STOPS.workHdm, MATCHES['HDM Philipp-Reis-Straße Walldorf']);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.id, 'de:08226:9000');
+});
+
+test('pickStopMatch: nichts Passendes → notFound', () => {
+  const r = pickStopMatch('home', STOPS.home, MATCHES.Bruchsal);
+  assert.equal(r.status, 'notFound');
+});
+
+test('buildCombinations: Hinweg 2×4, Via-Halte in Fahrtreihenfolge', () => {
+  const combos = buildCombinations(OUTBOUND);
+  assert.equal(combos.length, 8);
+  const busA1 = combos.find((c) => c.id === 'bus+A1');
+  assert.deepEqual(busA1.via, ['grabenNeudorf', 'neulussheim']);
+  assert.deepEqual(busA1.from, ['home']);
+  assert.deepEqual(busA1.to, ['workIndustrie', 'workHdm']);
+  const bikeB = combos.find((c) => c.id === 'bike+B');
+  assert.deepEqual(bikeB.from, ['grabenNeudorf']);
+  assert.equal(bikeB.fixedBefore.minutes, 28);
+  assert.ok(bikeB.usesBike);
+  assert.ok(bikeB.fallback);
+});
+
+test('buildCombinations: Rückweg – Rad am Ende, Fußweg am Anfang', () => {
+  const combos = buildCombinations(RETURN);
+  assert.equal(combos.length, 8);
+  const bBike = combos.find((c) => c.id === 'B+bike');
+  assert.deepEqual(bBike.from, ['wieslochWalldorf']);
+  assert.deepEqual(bBike.to, ['grabenNeudorf']);
+  assert.equal(bBike.fixedBefore.mode, 'walk');
+  assert.equal(bBike.fixedAfter.mode, 'bike');
+  assert.deepEqual(combos.find((c) => c.id === 'A2+bus').via, ['hockenheim', 'grabenNeudorf']);
+});
+
+test('combinationsEnRoute: passierte Via-Halte fallen weg, gleiche Wege werden zusammengefasst', () => {
+  const combos = combinationsEnRoute(buildCombinations(OUTBOUND), (k) => k === 'grabenNeudorf');
+  assert.equal(combos.length, 4); // Bus·A1 und Rad·A1 sind ab hier identisch
+  const a1 = combos.find((c) => c.via.includes('neulussheim'));
+  assert.equal(a1.name, 'S9 + Bus über Neulußheim');
+  assert.equal(a1.fixedBefore, null);
+});
+
+test('analyzeTransfers: Puffer inkl. Fußweg, knapp + stündlich erkannt', () => {
+  const t0 = NOW;
+  const leg = (from, to, start, end, kind = 'transit') => ({
+    kind, mode: kind === 'transit' ? 'SUBURBAN' : 'WALK', line: 'S9', fromName: from, toName: to,
+    start, end, scheduledStart: start, scheduledEnd: end, delayStartMin: 0, delayEndMin: 0, realTime: true,
+  });
+  const legs = [
+    leg('Graben-Neudorf', 'Neulußheim', t0, t0 + 20 * MIN),
+    leg('Neulußheim', 'Neulußheim Bahnhof', t0 + 20 * MIN, t0 + 22 * MIN, 'walk'),
+    leg('Neulußheim Bahnhof', 'Walldorf Industriestraße', t0 + 26 * MIN, t0 + 40 * MIN),
+  ];
+  const [risk] = analyzeTransfers(legs, [{ key: 'neulussheim', expected: 'Neulußheim', name: 'Neulußheim', id: 'x' }], 5);
+  assert.equal(risk.bufferMin, 4); // 6 Min. Abstand − 2 Min. Fußweg
+  assert.equal(risk.level, 'tight');
+  assert.equal(risk.critical, true);
+});
+
+test('weatherAt: Schwellenwerte aus config', () => {
+  const hour = Math.ceil(NOW / 3_600_000) * 3_600_000;
+  const data = { current: { time: NOW, temperature: 12, precipitation: 0, wind: 10 }, hourly: [{ time: hour, temperature: 4, precipitation: 0.5, wind: 35 }] };
+  const w = weatherAt(data, NOW, WEATHER.goodBikeWeather);
+  assert.equal(w.good, false);
+  assert.deepEqual(w.reasons, ['Regen', 'kalt', 'Wind']);
+  const ok = weatherAt({ ...data, hourly: [] }, NOW, WEATHER.goodBikeWeather);
+  assert.equal(ok.good, true);
+});
+
+test('rankConnections: früheste Ankunft gewinnt, ausgefallene ans Ende', () => {
+  const c = (id, arrival, extra = {}) => ({ id, arrival, departure: 0, transfers: 1, riskLevel: 'ok', cancelled: false, ...extra });
+  const r = rankConnections([c('a', 300), c('b', 100, { cancelled: true }), c('c', 200)]);
+  assert.deepEqual(r.map((x) => x.id), ['c', 'a', 'b']);
+  assert.equal(r[0].best, true);
+  assert.equal(r[2].best, false);
+});
+
+test('recommendationChanged vergleicht nur noch offene Fahrten', () => {
+  const conn = (trips) => ({ legs: trips.map(([tripId, end]) => ({ kind: 'transit', tripId, end })) });
+  const prev = recommendationKey(conn([['s9', NOW - MIN], ['bus1', NOW + 30 * MIN]]));
+  assert.equal(recommendationChanged(prev, conn([['bus1', NOW + 31 * MIN]]), NOW), false);
+  assert.equal(recommendationChanged(prev, conn([['bus2', NOW + 25 * MIN]]), NOW), true);
+});
+
+test('nextStopOfTrip: nächster Halt nach jetzt', () => {
+  const iso = (m) => new Date(NOW + m * MIN).toISOString();
+  const trip = { legs: [{ mode: 'SUBURBAN', from: { name: 'A', departure: iso(-10) }, intermediateStops: [{ name: 'B', arrival: iso(-2) }, { name: 'C', arrival: iso(3), stopId: 'c' }], to: { name: 'D', arrival: iso(9) } }] };
+  const { next, passed } = nextStopOfTrip(trip, NOW);
+  assert.equal(next.name, 'C');
+  assert.deepEqual(passed.map((p) => p.name), ['A', 'B']);
+});
+
+test('planJourney Hinweg: Kombinationen, Rad-Zeitversatz, Rangliste, mehrdeutige Haltestelle', async () => {
+  const { client, calls } = createFakeClient();
+  const stops = await resolveStops(client, STOPS);
+  assert.equal(stops.oftersheim.status, 'ambiguous');
+  assert.equal(stops.home.id, 'de:08215:1001');
+
+  const weather = { current: { time: NOW, temperature: 15, precipitation: 0, wind: 5 }, hourly: [] };
+  const { connections, results } = await planJourney({
+    client, journey: OUTBOUND, stops, rules: RULES, now: NOW, weather, weatherThresholds: WEATHER.goodBikeWeather,
+  });
+
+  // A3 (Oftersheim) nicht geklärt → Fehler statt Raten
+  assert.equal(results.filter((r) => r.status === 'error').length, 2);
+  assert.match(results.find((r) => r.combo.id === 'bus+A3').error, /Oftersheim/);
+
+  // Rad: Suche ab Graben-Neudorf startet jetzt + 28 Min.
+  const bikePlan = calls.find((c) => c.type === 'plan' && c.fromPlace === 'de:08215:2000');
+  assert.equal(bikePlan.time, NOW + 28 * MIN);
+
+  // Beste Verbindung hervorgehoben, sortiert nach Ankunft
+  assert.equal(connections.filter((c) => c.best).length, 1);
+  for (let i = 1; i < connections.length; i++) assert.ok(connections[i - 1].arrival <= connections[i].arrival);
+
+  // Rad-Verbindungen: Losfahren 28 Min. vor Abfahrt, Wetter angehängt
+  const bike = connections.find((c) => c.usesBike);
+  assert.equal(bike.legs[0].kind, 'bike');
+  assert.equal(bike.legs[1].start - bike.departure, 28 * MIN);
+  assert.equal(bike.weather.good, true);
+
+  // Neulußheim-Umstieg ist knapp (3 Min.) und kritisch
+  const a1 = connections.find((c) => c.comboId === 'bus+A1');
+  assert.equal(a1.riskLevel, 'critical');
+
+  // Echtzeit-Hinweis
+  assert.ok(connections.some((c) => c.realtime === 'none'));
+});
+
+test('planJourney: Weg B ohne Ergebnis zur Arbeit → Schätzung ab Wiesloch-Walldorf (+15 Min.)', async () => {
+  const { client } = createFakeClient({ emptyTo: ['de:08226:8000', 'de:08226:9000'] });
+  const stops = await resolveStops(client, STOPS);
+  const { connections } = await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  const b = connections.filter((c) => c.comboId.endsWith('+B'));
+  assert.ok(b.length > 0);
+  assert.ok(b.every((c) => c.estimated));
+  const est = b[0].legs.find((l) => l.kind === 'estimate');
+  assert.equal(est.end - est.start, 15 * MIN);
+});
+
+test('planJourney GPS: Start mit Koordinaten, Graben-Neudorf liegt hinter mir', async () => {
+  const { client, calls } = createFakeClient();
+  const stops = await resolveStops(client, STOPS);
+  // Standort bei Waghäusel (zwischen Graben-Neudorf und Neulußheim)
+  await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, start: { type: 'gps', lat: 49.25, lon: 8.52 }, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  const plans = calls.filter((c) => c.type === 'plan');
+  assert.ok(plans.every((p) => p.fromPlace === '49.25,8.52'));
+  assert.ok(plans.every((p) => !p.via.includes('de:08215:2000')));
+  assert.equal(plans[0].maxPreTransitTime, RULES.maxPreTransitSecondsFromGps);
+});
+
+test('planJourney: API-Fehler einer Variante bricht den Rest nicht ab', async () => {
+  const { client } = createFakeClient({ failVia: ['de:08226:6000'] });
+  const stops = await resolveStops(client, STOPS);
+  const { results } = await planJourney({ client, journey: RETURN, stops, rules: RULES, now: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  assert.ok(results.some((r) => r.status === 'error' && /500/.test(r.error)));
+  assert.ok(results.some((r) => r.status === 'ok'));
+});

@@ -1,0 +1,652 @@
+// plan-b – reine Logik: Kombinationen bilden, Ergebnisse auswerten, sortieren, Umstiegsrisiko bewerten.
+// Keine DOM-, Browser- oder Netzwerkzugriffe. Alle Zeiten sind Millisekunden (Date.now()-Format).
+// → wandert später fast unverändert in einen NestJS-Service (z. B. RoutingLogicService).
+
+/**
+ * @typedef {import('./config.js').StopConfig} StopConfig
+ * @typedef {import('./config.js').StageOption} StageOption
+ * @typedef {import('./config.js').Journey} Journey
+ * @typedef {import('./config.js').FixedPart} FixedPart
+ */
+
+/**
+ * @typedef {Object} ResolvedStop
+ * @property {string} key
+ * @property {'ok'|'ambiguous'|'notFound'|'error'} status
+ * @property {'config'|'geocode'|'choice'} [source]
+ * @property {string|null} id
+ * @property {string} name        Name laut API (bzw. Config)
+ * @property {string} expected    Name laut Config
+ * @property {string} place
+ * @property {string} [area]      Ort laut API
+ * @property {number} [lat]
+ * @property {number} [lon]
+ * @property {Array<{id:string,name:string,area:string,lat:number,lon:number}>} [candidates]
+ * @property {string} [error]
+ */
+
+/**
+ * Eine Kombination aus Etappe 1 + Etappe 2 = eine Variante in der Rangliste.
+ * @typedef {Object} Combination
+ * @property {string} id               z. B. "bike+A2"
+ * @property {string} name             Anzeigename
+ * @property {string[]} from
+ * @property {string[]} to
+ * @property {string[]} via
+ * @property {FixedPart|null} fixedBefore
+ * @property {FixedPart|null} fixedAfter
+ * @property {string[]} criticalTransfers
+ * @property {{to:string, minutes:number, label:string}|null} fallback
+ * @property {boolean} usesBike
+ */
+
+/**
+ * Eine konkrete Abfrage an /plan.
+ * @typedef {Object} PlanQuery
+ * @property {string} fromPlace   Stop-ID oder "lat,lon"
+ * @property {string} toPlace
+ * @property {string[]} via       Stop-IDs
+ * @property {number} time
+ * @property {number} [maxPreTransitTime]
+ */
+
+/**
+ * @typedef {Object} DisplayLeg
+ * @property {'transit'|'walk'|'bike'|'estimate'} kind
+ * @property {string} mode
+ * @property {string} line
+ * @property {string} [headsign]
+ * @property {string} fromName
+ * @property {string} toName
+ * @property {number} start
+ * @property {number} end
+ * @property {number} scheduledStart
+ * @property {number} scheduledEnd
+ * @property {number} delayStartMin
+ * @property {number} delayEndMin
+ * @property {boolean} realTime
+ * @property {boolean} cancelled
+ * @property {string} [tripId]
+ * @property {string} [fromStopId]
+ * @property {string} [toStopId]
+ * @property {string} [label]
+ */
+
+/**
+ * @typedef {Object} TransferRisk
+ * @property {string} atName
+ * @property {number} bufferMin   Puffer in Minuten (inkl. Echtzeit, abzüglich Fußweg)
+ * @property {'ok'|'tight'|'missed'} level
+ * @property {boolean} critical   Anschluss fährt nur stündlich
+ * @property {string} nextLine
+ */
+
+/**
+ * @typedef {Object} Connection
+ * @property {string} id
+ * @property {string} comboId
+ * @property {string} name
+ * @property {number} departure         Losgehen/-fahren (inkl. fester Anteile)
+ * @property {number} arrival           Voraussichtliche Ankunft (Echtzeit + feste Anteile + Schätzung)
+ * @property {number} scheduledArrival
+ * @property {number} transfers
+ * @property {DisplayLeg[]} legs
+ * @property {TransferRisk[]} risks
+ * @property {'ok'|'tight'|'critical'|'missed'} riskLevel
+ * @property {number} depDelayMin
+ * @property {number} arrDelayMin
+ * @property {'full'|'partial'|'none'} realtime
+ * @property {boolean} estimated
+ * @property {boolean} usesBike
+ * @property {number|null} bikeTime    Zeitpunkt der Radfahrt (für Wetter)
+ * @property {boolean} [best]
+ */
+
+const MIN = 60_000;
+const NON_TRANSIT = new Set(['WALK', 'BIKE', 'CAR', 'CAR_PARKING', 'CAR_DROPOFF', 'RENTAL', 'FLEX', 'ODM', 'DEBUG_BUS_ROUTE', 'DEBUG_RAILWAY_ROUTE', 'DEBUG_FERRY_ROUTE']);
+const STATION_WORDS = new Set(['bahnhof', 'bf', 'hbf', 'bahnhofsvorplatz']);
+
+// ---------------------------------------------------------------------------
+// Text-Normalisierung & Haltestellen-Abgleich
+// ---------------------------------------------------------------------------
+
+/** "Waldstr." → "waldstrasse", "Neulußheim" → "neulussheim" usw. */
+export function normalize(text) {
+  return String(text ?? '')
+    .toLowerCase()
+    .replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/ß/g, 'ss')
+    .replace(/(\p{L})str\b\.?/gu, '$1strasse')
+    .replace(/\bstr\b\.?/g, 'strasse')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+/** @returns {string[]} */
+export function tokens(text) {
+  return normalize(text).split(' ').filter(Boolean);
+}
+
+/**
+ * Wählt aus Geocoding-Treffern die passende Haltestelle aus – oder meldet Mehrdeutigkeit.
+ * Regel: Alle Wörter von Name + Ort müssen im Treffer (Name + Ortsangaben) vorkommen.
+ * Exakter Kernname gewinnt. Bleiben mehrere unterschiedliche Halte übrig → "ambiguous" (nicht raten!).
+ *
+ * @param {string} key
+ * @param {StopConfig} cfg
+ * @param {Array<any>} matches  Match-Objekte aus /api/v1/geocode
+ * @returns {ResolvedStop}
+ */
+export function pickStopMatch(key, cfg, matches) {
+  const placeTok = tokens(cfg.place);
+  const wanted = tokens(cfg.name);
+  const wantedCore = coreTokens(wanted, placeTok);
+
+  const candidates = (matches ?? [])
+    .filter((m) => !m.type || m.type === 'STOP')
+    .map((m) => {
+      const areaNames = (m.areas ?? []).map((a) => a.name);
+      const all = new Set([...tokens(m.name), ...areaNames.flatMap(tokens)]);
+      const core = coreTokens(tokens(m.name), placeTok);
+      return {
+        m,
+        area: pickArea(m.areas),
+        fits: wanted.every((t) => all.has(t)) && placeTok.every((t) => all.has(t)),
+        exact: sameSet(core, wantedCore),
+        rail: (m.modes ?? []).some((x) => /RAIL|SUBURBAN|METRO|HIGHSPEED|LONG_DISTANCE|NIGHT_RAIL/.test(x)),
+      };
+    })
+    .filter((c) => c.fits);
+
+  let pool = candidates.some((c) => c.exact) ? candidates.filter((c) => c.exact) : candidates;
+  pool = dedupeNearby(pool);
+  if (pool.length > 1 && cfg.rail && pool.some((c) => c.rail)) pool = pool.filter((c) => c.rail);
+
+  const toCandidate = (c) => ({ id: c.m.id, name: c.m.name, area: c.area, lat: c.m.lat, lon: c.m.lon });
+  const base = { key, expected: cfg.name, place: cfg.place };
+
+  if (pool.length === 0) {
+    return { ...base, status: 'notFound', id: null, name: cfg.name, candidates: (matches ?? []).slice(0, 5).map((m) => toCandidate({ m, area: pickArea(m.areas) })) };
+  }
+  if (pool.length > 1) {
+    return { ...base, status: 'ambiguous', id: null, name: cfg.name, candidates: pool.map(toCandidate) };
+  }
+  const c = pool[0];
+  return { ...base, status: 'ok', source: 'geocode', id: c.m.id, name: c.m.name, area: c.area, lat: c.m.lat, lon: c.m.lon };
+}
+
+function coreTokens(tok, placeTok) {
+  const core = tok.filter((t) => !STATION_WORDS.has(t) && !placeTok.includes(t));
+  return core.length ? core : tok.filter((t) => !STATION_WORDS.has(t));
+}
+function sameSet(a, b) {
+  return a.length === b.length && a.every((x) => b.includes(x));
+}
+function pickArea(areas) {
+  const list = areas ?? [];
+  return (list.find((a) => a.default) ?? list.find((a) => a.adminLevel === 8) ?? list[0])?.name ?? '';
+}
+/** Gleichnamige Halte im Umkreis von 400 m (z. B. Bahnsteige eines Bahnhofs) als einen zählen. */
+function dedupeNearby(pool) {
+  const out = [];
+  for (const c of pool) {
+    const dup = out.find((o) => distanceKm(o.m, c.m) < 0.4);
+    if (!dup) out.push(c);
+    else if (c.rail && !dup.rail) out[out.indexOf(dup)] = c;
+  }
+  return out;
+}
+
+/** Luftlinie in km (Haversine). */
+export function distanceKm(a, b) {
+  const R = 6371;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// ---------------------------------------------------------------------------
+// Kombinationen bilden
+// ---------------------------------------------------------------------------
+
+/**
+ * Bildet alle Kombinationen Etappe 1 × Etappe 2.
+ * from/to: spätere Etappe überschreibt; via wird aneinandergehängt.
+ * @param {Journey} journey
+ * @returns {Combination[]}
+ */
+export function buildCombinations(journey) {
+  const combos = [];
+  for (const s1 of journey.stage1) {
+    for (const s2 of journey.stage2) {
+      const via = [...(s1.via ?? []), ...(s2.via ?? [])];
+      combos.push({
+        id: `${s1.key}+${s2.key}`,
+        name: `${s1.name} · ${s2.name}`,
+        stage1: s1.key,
+        stage2: s2.key,
+        stage1Name: s1.name,
+        stage2Name: s2.name,
+        from: s2.from ?? s1.from ?? [],
+        to: s2.to ?? s1.to ?? [],
+        via,
+        fixedBefore: s1.fixedBefore ?? s2.fixedBefore ?? null,
+        fixedAfter: s2.fixedAfter ?? s1.fixedAfter ?? null,
+        criticalTransfers: [...(s1.criticalTransfers ?? []), ...(s2.criticalTransfers ?? [])],
+        fallback: s2.fallback ?? s1.fallback ?? null,
+        usesBike: [s1.fixedBefore, s2.fixedBefore, s1.fixedAfter, s2.fixedAfter].some((f) => f?.mode === 'bike'),
+      });
+    }
+  }
+  return combos;
+}
+
+/**
+ * Unterwegs: Kombinationen ab dem aktuellen Standort.
+ * - Feste Anteile VOR der Fahrt entfallen (ich bin ja schon unterwegs).
+ * - Bereits passierte Via-Halte und der Startort selbst werden entfernt.
+ * - Danach identische Kombinationen zusammenfassen (z. B. "Bus·A2" und "Rad·A2" ab Graben-Neudorf).
+ *
+ * @param {Combination[]} combos
+ * @param {(stopKey: string) => boolean} isPassed  true, wenn der Halt schon hinter mir liegt
+ * @returns {Combination[]}
+ */
+export function combinationsEnRoute(combos, isPassed) {
+  const groups = new Map();
+  for (const c of combos) {
+    const adapted = {
+      ...c,
+      from: [],
+      via: c.via.filter((v) => !isPassed(v)),
+      fixedBefore: null,
+      usesBike: c.fixedAfter?.mode === 'bike',
+    };
+    const sig = JSON.stringify([adapted.via, adapted.to, adapted.fixedAfter, adapted.fallback]);
+    if (!groups.has(sig)) groups.set(sig, []);
+    groups.get(sig).push(adapted);
+  }
+  return [...groups.values()].map((group) => {
+    const first = group[0];
+    const sameS1 = group.every((g) => g.stage1 === first.stage1);
+    const sameS2 = group.every((g) => g.stage2 === first.stage2);
+    let name = first.name;
+    if (!sameS1 && sameS2) name = first.stage2Name;
+    else if (sameS1 && !sameS2) name = first.stage1Name;
+    return {
+      ...first,
+      id: group.map((g) => g.id).join('|'),
+      name,
+      criticalTransfers: [...new Set(group.flatMap((g) => g.criticalTransfers))],
+    };
+  });
+}
+
+/**
+ * Entscheidet für GPS-Starts, ob ein Via-Halt schon "hinter mir" liegt:
+ * Bin ich dem Ziel näher als der Via-Halt, gilt er als passiert.
+ * @param {{lat:number,lon:number}} me
+ * @param {{lat:number,lon:number}|undefined} target
+ * @param {{lat:number,lon:number}|undefined} viaStop
+ */
+export function isViaBehind(me, target, viaStop) {
+  if (!target || !viaStop || viaStop.lat == null || target.lat == null) return false;
+  return distanceKm(me, target) < distanceKm(viaStop, target);
+}
+
+/**
+ * Erzeugt die konkreten /plan-Abfragen einer Kombination (jede Start- × jede Ziel-Haltestelle).
+ * Feste Anteile: Suche startet "jetzt + feste Dauer" am jeweiligen Bahnhof.
+ *
+ * @param {Combination} combo
+ * @param {Record<string, ResolvedStop>} stops
+ * @param {number} now
+ * @param {{place: string, time?: number, maxPreTransitTime?: number}} [start]  Unterwegs-Startpunkt
+ * @returns {{queries: PlanQuery[], missing: string[]}}
+ */
+export function buildQueries(combo, stops, now, start) {
+  const missing = [];
+  const idOf = (key) => {
+    const s = stops[key];
+    if (!s || !s.id) missing.push(key);
+    return s?.id;
+  };
+  const via = combo.via.map(idOf);
+  const to = combo.to.map(idOf);
+  const from = start ? [start.place] : combo.from.map(idOf);
+  if (via.length > 2) missing.push('(mehr als 2 Via-Halte – MOTIS erlaubt max. 2)');
+  if (missing.length) return { queries: [], missing: [...new Set(missing)] };
+
+  const time = (start?.time ?? now) + (combo.fixedBefore ? combo.fixedBefore.minutes * MIN : 0);
+  const queries = [];
+  for (const f of from) {
+    for (const t of to) {
+      queries.push({ fromPlace: f, toPlace: t, via, time, maxPreTransitTime: start?.maxPreTransitTime });
+    }
+  }
+  return { queries, missing: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Ergebnisse auswerten
+// ---------------------------------------------------------------------------
+
+const ms = (iso) => (iso ? Date.parse(iso) : NaN);
+export const isTransitMode = (mode) => !NON_TRANSIT.has(mode);
+
+/**
+ * Führt die Itineraries mehrerer Abfragen (z. B. zu beiden Arbeits-Haltestellen) zusammen:
+ * gleiche Erstfahrt → nur die mit früherer Ankunft behalten; dann die nächsten N nach Abfahrt.
+ * @param {any[]} itineraries  MOTIS-Itineraries
+ * @param {number} limit
+ * @param {number} notBefore    frühestmögliche Abfahrt
+ */
+export function mergeItineraries(itineraries, limit, notBefore = 0) {
+  const byFirstTrip = new Map();
+  for (const it of itineraries) {
+    const first = (it.legs ?? []).find((l) => isTransitMode(l.mode));
+    if (!first) continue; // reine Fußwege ignorieren
+    if (ms(first.startTime) < notBefore - MIN) continue;
+    const key = `${first.tripId ?? first.routeShortName}@${first.scheduledStartTime}`;
+    const prev = byFirstTrip.get(key);
+    if (!prev || ms(it.endTime) < ms(prev.endTime)) byFirstTrip.set(key, it);
+  }
+  return [...byFirstTrip.values()]
+    .sort((a, b) => firstTransitStart(a) - firstTransitStart(b))
+    .slice(0, limit);
+}
+
+function firstTransitStart(it) {
+  const l = it.legs.find((x) => isTransitMode(x.mode));
+  return ms(l?.startTime ?? it.startTime);
+}
+
+/** MOTIS-Leg → Anzeige-Leg */
+export function toDisplayLeg(l) {
+  const transit = isTransitMode(l.mode);
+  const start = ms(l.startTime);
+  const end = ms(l.endTime);
+  const scheduledStart = ms(l.scheduledStartTime ?? l.startTime);
+  const scheduledEnd = ms(l.scheduledEndTime ?? l.endTime);
+  return {
+    kind: transit ? 'transit' : l.mode === 'BIKE' ? 'bike' : 'walk',
+    mode: l.mode,
+    line: transit ? (l.displayName || l.routeShortName || l.tripShortName || l.mode) : '',
+    headsign: l.headsign,
+    fromName: l.from?.name ?? '',
+    toName: l.to?.name ?? '',
+    fromStopId: l.from?.stopId,
+    toStopId: l.to?.stopId,
+    start, end, scheduledStart, scheduledEnd,
+    delayStartMin: Math.round((start - scheduledStart) / MIN),
+    delayEndMin: Math.round((end - scheduledEnd) / MIN),
+    realTime: !!l.realTime,
+    cancelled: !!(l.cancelled || l.from?.cancelled || l.to?.cancelled),
+    tripId: l.tripId,
+  };
+}
+
+/**
+ * Prüft, ob ein Ort einer Config-Haltestelle entspricht (über ID oder Name).
+ * @param {{name?:string, stopId?:string}} place
+ * @param {ResolvedStop|undefined} stop
+ */
+export function placeMatchesStop(place, stop) {
+  if (!stop || !place) return false;
+  if (stop.id && (place.stopId === stop.id || place.parentId === stop.id)) return true;
+  const want = tokens(stop.expected ?? stop.name).filter((t) => !STATION_WORDS.has(t));
+  const have = new Set(tokens(place.name));
+  return want.length > 0 && want.every((t) => have.has(t));
+}
+
+/**
+ * Bewertet die Umstiege: Puffer = Abfahrt nächster Zug/Bus − Ankunft vorheriger − Fußweg dazwischen.
+ * Echtzeit-Zeiten fließen automatisch ein (startTime/endTime sind bei Echtzeit schon korrigiert).
+ *
+ * @param {DisplayLeg[]} legs
+ * @param {ResolvedStop[]} criticalStops
+ * @param {number} tightMinutes
+ * @returns {TransferRisk[]}
+ */
+export function analyzeTransfers(legs, criticalStops, tightMinutes) {
+  const risks = [];
+  let prev = null;
+  let walkMs = 0;
+  for (const leg of legs) {
+    if (leg.kind !== 'transit') {
+      if (prev) walkMs += leg.end - leg.start;
+      continue;
+    }
+    if (prev) {
+      const bufferMin = Math.floor((leg.start - prev.end - walkMs) / MIN);
+      const critical = criticalStops.some(
+        (s) => placeMatchesStop({ name: prev.toName, stopId: prev.toStopId }, s) ||
+               placeMatchesStop({ name: leg.fromName, stopId: leg.fromStopId }, s),
+      );
+      risks.push({
+        atName: prev.toName,
+        bufferMin,
+        level: bufferMin < 0 ? 'missed' : bufferMin < tightMinutes ? 'tight' : 'ok',
+        critical,
+        nextLine: leg.line,
+      });
+    }
+    prev = leg;
+    walkMs = 0;
+  }
+  return risks;
+}
+
+/** Gesamtrisiko einer Verbindung */
+export function overallRisk(risks) {
+  if (risks.some((r) => r.level === 'missed')) return 'missed';
+  if (risks.some((r) => r.level === 'tight' && r.critical)) return 'critical';
+  if (risks.some((r) => r.level === 'tight')) return 'tight';
+  return 'ok';
+}
+
+/**
+ * Wandelt ein MOTIS-Itinerary in eine bewertete Verbindung um (inkl. fester Anteile und Schätzung).
+ *
+ * @param {any} it
+ * @param {Combination} combo
+ * @param {Record<string, ResolvedStop>} stops
+ * @param {{tightTransferMinutes:number}} rules
+ * @param {{minutes:number,label:string}|null} [estimate]  Fallback-Schätzung (Weg B)
+ * @returns {Connection}
+ */
+export function analyzeItinerary(it, combo, stops, rules, estimate = null) {
+  const legs = (it.legs ?? []).map(toDisplayLeg);
+  // Fuß-/Radwege des Routers am Anfang/Ende bleiben drin (z. B. GPS-Start zur Haltestelle).
+  const transit = legs.filter((l) => l.kind === 'transit');
+  const firstT = transit[0];
+  const lastT = transit[transit.length - 1];
+  const itStart = ms(it.startTime);
+  let itEnd = ms(it.endTime);
+  let scheduledEnd = legs.length ? legs[legs.length - 1].scheduledEnd : itEnd;
+
+  const out = [...legs];
+  let departure = itStart;
+  let bikeTime = null;
+
+  if (combo.fixedBefore) {
+    const f = combo.fixedBefore;
+    departure = itStart - f.minutes * MIN;
+    out.unshift(fixedLeg(f, departure, itStart));
+    if (f.mode === 'bike') bikeTime = departure;
+  }
+  if (estimate) {
+    out.push({ ...fixedLeg({ mode: 'estimate', label: estimate.label }, itEnd, itEnd + estimate.minutes * MIN), kind: 'estimate' });
+    itEnd += estimate.minutes * MIN;
+    scheduledEnd += estimate.minutes * MIN;
+  }
+  let arrival = itEnd;
+  if (combo.fixedAfter) {
+    const f = combo.fixedAfter;
+    out.push(fixedLeg(f, itEnd, itEnd + f.minutes * MIN));
+    if (f.mode === 'bike') bikeTime = itEnd;
+    arrival = itEnd + f.minutes * MIN;
+    scheduledEnd += f.minutes * MIN;
+  }
+
+  const criticalStops = combo.criticalTransfers.map((k) => stops[k]).filter(Boolean);
+  const risks = analyzeTransfers(legs, criticalStops, rules.tightTransferMinutes);
+  const rtCount = transit.filter((l) => l.realTime).length;
+
+  return {
+    id: `${combo.id}#${firstT?.tripId ?? ''}@${firstT?.scheduledStart ?? itStart}`,
+    comboId: combo.id,
+    name: combo.name,
+    departure,
+    arrival,
+    scheduledArrival: scheduledEnd,
+    transfers: Math.max(0, transit.length - 1),
+    legs: out,
+    risks,
+    riskLevel: overallRisk(risks),
+    depDelayMin: firstT?.delayStartMin ?? 0,
+    arrDelayMin: lastT?.delayEndMin ?? 0,
+    realtime: rtCount === 0 ? 'none' : rtCount === transit.length ? 'full' : 'partial',
+    cancelled: transit.some((l) => l.cancelled),
+    estimated: !!estimate,
+    usesBike: combo.usesBike,
+    bikeTime,
+  };
+}
+
+function fixedLeg(f, start, end) {
+  return {
+    kind: f.mode === 'bike' ? 'bike' : f.mode === 'walk' ? 'walk' : 'estimate',
+    mode: f.mode.toUpperCase(),
+    line: '',
+    label: f.label,
+    fromName: '', toName: '',
+    start, end, scheduledStart: start, scheduledEnd: end,
+    delayStartMin: 0, delayEndMin: 0,
+    realTime: false, cancelled: false,
+  };
+}
+
+/**
+ * Gemeinsame Rangliste: nach voraussichtlicher Ankunft, bei Gleichstand spätere Abfahrt
+ * (weniger Wartezeit), dann weniger Umstiege. Ausgefallene/verpasste Anschlüsse ans Ende.
+ * Markiert die beste Verbindung mit best = true.
+ * @param {Connection[]} list
+ * @returns {Connection[]}
+ */
+export function rankConnections(list) {
+  const broken = (c) => c.cancelled || c.riskLevel === 'missed';
+  const sorted = [...list].sort(
+    (a, b) => Number(broken(a)) - Number(broken(b)) ||
+      a.arrival - b.arrival ||
+      b.departure - a.departure ||
+      a.transfers - b.transfers,
+  );
+  return sorted.map((c, i) => ({ ...c, best: i === 0 && !broken(c) }));
+}
+
+// ---------------------------------------------------------------------------
+// Wetter
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {Object} WeatherPoint
+ * @property {number} time
+ * @property {number} temperature  °C
+ * @property {number} precipitation mm/h
+ * @property {number} wind         km/h
+ *
+ * @typedef {Object} WeatherData
+ * @property {WeatherPoint} current
+ * @property {WeatherPoint[]} hourly
+ */
+
+/**
+ * Wetter zum Zeitpunkt der Radfahrt (passende Stunde der Vorhersage) + Bewertung.
+ * @param {WeatherData|null} data
+ * @param {number} time
+ * @param {{maxPrecipitationMm:number,minTemperatureC:number,maxWindKmh:number}} t
+ */
+export function weatherAt(data, time, t) {
+  if (!data) return null;
+  // Open-Meteo-Stundenwerte gelten für die Stunde VOR dem Zeitstempel → aufrunden.
+  const hour = Math.ceil(time / 3_600_000) * 3_600_000;
+  const p = data.hourly.find((h) => h.time === hour) ?? data.current;
+  const reasons = [];
+  if (!(p.precipitation < t.maxPrecipitationMm)) reasons.push('Regen');
+  if (!(p.temperature > t.minTemperatureC)) reasons.push('kalt');
+  if (!(p.wind < t.maxWindKmh)) reasons.push('Wind');
+  return { ...p, good: reasons.length === 0, reasons };
+}
+
+// ---------------------------------------------------------------------------
+// Unterwegs: Position in einer Fahrt, Empfehlungswechsel
+// ---------------------------------------------------------------------------
+
+/**
+ * Findet in der aktuellen Fahrt (Antwort von /trip) den nächsten Halt nach "now".
+ * @param {any} tripItinerary  Itinerary aus /api/v6/trip
+ * @param {number} now
+ * @returns {{next: any|null, passed: any[]}}  next = MOTIS-Place mit stopId & Zeiten
+ */
+export function nextStopOfTrip(tripItinerary, now) {
+  const leg = tripItinerary?.legs?.find((l) => isTransitMode(l.mode)) ?? tripItinerary?.legs?.[0];
+  if (!leg) return { next: null, passed: [] };
+  const seq = [leg.from, ...(leg.intermediateStops ?? []), leg.to].filter(Boolean);
+  const timeOf = (p) => ms(p.arrival ?? p.departure);
+  const idx = seq.findIndex((p) => timeOf(p) > now);
+  if (idx === -1) return { next: null, passed: seq };
+  return { next: seq[idx], passed: seq.slice(0, idx) };
+}
+
+/**
+ * Die Fahrt, in der ich laut gewählter Verbindung gerade sitze (oder als nächstes einsteige).
+ * @param {Connection} conn
+ * @param {number} now
+ */
+export function currentTransitLeg(conn, now) {
+  const t = conn.legs.filter((l) => l.kind === 'transit' && l.tripId);
+  return t.find((l) => l.start <= now && now < l.end) ?? t.find((l) => l.start > now) ?? null;
+}
+
+/**
+ * Nächster Handlungsschritt einer Verbindung ab "now" (für "Neue Empfehlung: …").
+ * @param {Connection} conn
+ * @param {number} now
+ * @returns {{type:'board'|'change'|'arrive', stop:string, line?:string, headsign?:string, time:number}}
+ */
+export function nextStep(conn, now) {
+  const transit = conn.legs.filter((l) => l.kind === 'transit');
+  const riding = transit.findIndex((l) => l.start <= now && now < l.end);
+  if (riding >= 0) {
+    const next = transit[riding + 1];
+    return next
+      ? { type: 'change', stop: transit[riding].toName, line: next.line, headsign: next.headsign, time: next.start }
+      : { type: 'arrive', stop: transit[riding].toName, time: transit[riding].end };
+  }
+  const upcoming = transit.find((l) => l.start > now) ?? transit[0];
+  return { type: 'board', stop: upcoming?.fromName ?? '', line: upcoming?.line, headsign: upcoming?.headsign, time: upcoming?.start ?? conn.departure };
+}
+
+/**
+ * "Fingerabdruck" einer Empfehlung: die Folge der Fahrten (tripIds) mit Ankunftszeit.
+ * Unabhängig von Varianten-IDs, damit der Wechsel normal → unterwegs nicht als neue Empfehlung zählt.
+ * @param {Connection} conn
+ * @returns {Array<{tripId: string, end: number}>}
+ */
+export function recommendationKey(conn) {
+  return conn.legs.filter((l) => l.kind === 'transit').map((l) => ({ tripId: l.tripId ?? l.line, end: l.end }));
+}
+
+/**
+ * Hat sich die beste Verbindung gegenüber der letzten Prüfung geändert?
+ * Verglichen werden nur Fahrten, die noch nicht beendet sind.
+ * @param {Array<{tripId: string, end: number}>|null} previous  recommendationKey der letzten besten Verbindung
+ * @param {Connection|undefined} best
+ * @param {number} now
+ */
+export function recommendationChanged(previous, best, now) {
+  if (!previous || !best) return false;
+  const remaining = (list) => list.filter((t) => t.end > now).map((t) => t.tripId).join('|');
+  return remaining(previous) !== remaining(recommendationKey(best));
+}

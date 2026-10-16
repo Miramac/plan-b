@@ -1,0 +1,14 @@
+{
+  "name": "plan-b",
+  "version": "0.1.0",
+  "description": "plan-b – vergleicht Pendel-Varianten (Transitous/MOTIS + Open-Meteo) und empfiehlt die schnellste.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8080",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

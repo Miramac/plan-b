@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#0f766e">
+  <title>plan-b – Pendel-Vergleich</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="ui.js"></script>
+</head>
+<body>
+  <header class="top">
+    <h1>plan-b</h1>
+    <p class="sub">Welche Pendel-Variante ist jetzt die schnellste?</p>
+  </header>
+
+  <main>
+    <section class="actions" aria-label="Richtung wählen">
+      <button class="primary" id="btn-outbound" type="button">🏢 Zur Arbeit</button>
+      <button class="primary" id="btn-return" type="button">🏠 Nach Hause</button>
+    </section>
+
+    <section class="enroute card" id="enroute" aria-labelledby="enroute-title">
+      <div class="enroute-head">
+        <h2 id="enroute-title">Unterwegs</h2>
+        <button type="button" class="ghost" id="btn-enroute">📍 Ich bin unterwegs</button>
+      </div>
+      <div id="enroute-body" hidden>
+        <div class="row">
+          <span class="label">Richtung</span>
+          <div class="seg" role="radiogroup">
+            <label><input type="radio" name="dir" value="outbound" checked> Zur Arbeit</label>
+            <label><input type="radio" name="dir" value="return"> Nach Hause</label>
+          </div>
+        </div>
+        <div class="row">
+          <button type="button" id="btn-gps">📍 Ab meinem Standort planen</button>
+        </div>
+        <div class="row col">
+          <label class="label" for="sel-trip">Ich sitze gerade in …</label>
+          <div class="inline">
+            <select id="sel-trip"><option value="">– erst eine Abfrage starten –</option></select>
+            <button type="button" id="btn-trip" disabled>Ab nächstem Halt planen</button>
+          </div>
+        </div>
+        <div class="row">
+          <button type="button" id="btn-refresh" disabled>🔄 Neu prüfen</button>
+          <label class="check"><input type="checkbox" id="chk-auto"> Auto alle 3 Min.</label>
+          <button type="button" class="ghost small" id="btn-enroute-stop">Beenden</button>
+        </div>
+        <p class="hint" id="enroute-status"></p>
+      </div>
+    </section>
+
+    <div id="messages" aria-live="polite"></div>
+    <div id="weather"></div>
+    <div id="summary"></div>
+    <ol id="results" class="results"></ol>
+
+    <details class="card" id="stops-panel">
+      <summary>Haltestellen (Kontrolle &amp; IDs)</summary>
+      <div id="stops"><p class="hint">Werden bei der ersten Abfrage per Transitous-Geocoding ermittelt.</p></div>
+    </details>
+  </main>
+
+  <footer class="foot">
+    Daten: <a href="https://transitous.org" rel="noopener">Transitous</a> (MOTIS) ·
+    Wetter: <a href="https://open-meteo.com" rel="noopener">Open-Meteo</a>
+  </footer>
+</body>
+</html>
