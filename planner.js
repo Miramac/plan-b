@@ -3,7 +3,7 @@
 
 import {
   pickStopMatch, buildCombinations, combinationsEnRoute, buildQueries, mergeItineraries,
-  analyzeItinerary, rankConnections, weatherAt, isViaBehind, placeMatchesStop,
+  analyzeItinerary, fitsVariant, rankConnections, weatherAt, isViaBehind, placeMatchesStop,
   nextStopOfTrip, currentTransitLeg, tokens,
 } from './logic.js';
 
@@ -165,8 +165,14 @@ async function runCombination({ client, combo, stops, rules, now, startInfo }) {
     return { combo, status: 'error', error: `Haltestelle nicht geklärt: ${names}`, connections: [] };
   }
 
-  const ask = (qs) => Promise.allSettled(qs.map((q) => client.plan({ ...q, numItineraries: rules.connectionsPerVariant })));
-  const collect = (settled) => settled.filter((s) => s.status === 'fulfilled').flatMap((s) => s.value.itineraries ?? []);
+  // viaMinimumStay ≥ 1 → am Via-Halt wird wirklich ausgestiegen (nicht nur durchgefahren)
+  const viaMinimumStay = (q) => q.via.map(() => rules.viaMinimumStayMinutes);
+  const ask = (qs) => Promise.allSettled(qs.map((q) => client.plan({ ...q, viaMinimumStay: viaMinimumStay(q), numItineraries: rules.connectionsPerVariant })));
+  // Nur Verbindungen behalten, die zur Variante passen (Bus-Umstieg am richtigen Bahnhof)
+  const collect = (settled) => settled
+    .filter((s) => s.status === 'fulfilled')
+    .flatMap((s) => s.value.itineraries ?? [])
+    .filter((it) => fitsVariant(it, combo, stops));
 
   const settled = await ask(queries);
   if (settled.every((s) => s.status === 'rejected')) {

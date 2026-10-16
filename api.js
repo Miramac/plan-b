@@ -83,7 +83,8 @@ export function createTransitousClient({ baseUrl, maxParallel = 4, fetchImpl = g
     /**
      * Verbindungssuche. fromPlace/toPlace = Stop-ID oder "lat,lon".
      * via: max. 2 Stop-IDs, die die Verbindung passieren muss (MOTIS-Feature).
-     * @param {PlanQuery & {numItineraries?: number}} q
+     * viaMinimumStay: Mindestaufenthalt je Via-Halt in Minuten (0 = Durchfahren reicht, ≥1 = aussteigen).
+     * @param {PlanQuery & {numItineraries?: number, viaMinimumStay?: number[]}} q
      * @returns {Promise<{itineraries: any[]}>}
      */
     plan(q) {
@@ -91,7 +92,7 @@ export function createTransitousClient({ baseUrl, maxParallel = 4, fetchImpl = g
         fromPlace: q.fromPlace,
         toPlace: q.toPlace,
         via: q.via?.length ? q.via.join(',') : undefined,
-        viaMinimumStay: q.via?.length ? q.via.map(() => 0).join(',') : undefined,
+        viaMinimumStay: q.via?.length ? q.via.map((_, i) => q.viaMinimumStay?.[i] ?? 0).join(',') : undefined,
         time: new Date(q.time).toISOString(),
         numItineraries: q.numItineraries ?? 3,
         maxPreTransitTime: q.maxPreTransitTime,

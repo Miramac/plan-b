@@ -36,7 +36,13 @@ Für GPS (Unterwegs-Modus) muss die Seite über HTTPS (oder localhost) laufen.
 
 ## Haltestellen
 
-Die IDs werden bei der ersten Abfrage per Geocoding ermittelt und im Browser gespeichert. Die Seite zeigt unter **„Haltestellen“** eine Kontroll-Tabelle (Name, Ort, ID). Ist ein Treffer mehrdeutig, wird nicht geraten: Du wählst den richtigen Halt aus. Die angezeigte Kopiervorlage in `config.js → STOPS` übernehmen; danach entfällt das Geocoding.
+Die Transitous-IDs sind fest in `config.js → STOPS` eingetragen, ermittelt per Geocoding und mit Live-Abfragen geprüft. Setzt du bei einer Haltestelle `id: null`, sucht die App sie bei der nächsten Abfrage selbst über `name` und `place`. Die Seite zeigt unter **„Haltestellen“** eine Kontroll-Tabelle und eine Kopiervorlage. Bei mehrdeutigen Treffern wird nicht geraten: Du wählst den richtigen Halt aus.
+
+## Besonderheiten der MOTIS-API
+
+- **Via-Halte:** Ohne Mindestaufenthalt zählt auch ein Zug, der nur durchfährt. Deshalb setzt die App `viaMinimumStay = 1` (`RULES.viaMinimumStayMinutes`) und erzwingt so das Aussteigen.
+- **Varianten A1–A3:** Zusätzlich prüft die App, dass am Bahnhof wirklich zwischen Bus und Bahn umgestiegen wird (`busTransferAt`). Sonst wird die Verbindung verworfen.
+- **Echtzeit:** Gibt es erst kurz vor der Fahrt. Abfragen für spätere Tage zeigen daher „keine Echtzeitdaten“.
 
 ## Nutzungsregeln Transitous
 

@@ -5,13 +5,15 @@ import assert from 'node:assert/strict';
 import { STOPS, OUTBOUND, RETURN, RULES, WEATHER } from '../config.js';
 import {
   normalize, pickStopMatch, buildCombinations, combinationsEnRoute, analyzeTransfers,
-  weatherAt, rankConnections, recommendationChanged, recommendationKey, nextStopOfTrip,
+  weatherAt, rankConnections, fitsVariant, recommendationChanged, recommendationKey, nextStopOfTrip,
 } from '../logic.js';
 import { resolveStops, planJourney } from '../planner.js';
 import { createFakeClient, MATCHES } from './fake-transitous.js';
 
 const MIN = 60_000;
 const NOW = Date.parse('2026-10-19T05:30:00Z');
+// Für die Tests ohne feste IDs → Haltestellen werden über den Fake-Geocoder gesucht
+const GEO_STOPS = Object.fromEntries(Object.entries(STOPS).map(([k, v]) => [k, { ...v, id: null }]));
 
 test('normalize vereinheitlicht Umlaute, ß und Straßen-Abkürzungen', () => {
   assert.equal(normalize('Philipp-Reis-Str.'), 'philipp reis strasse');
@@ -20,7 +22,7 @@ test('normalize vereinheitlicht Umlaute, ß und Straßen-Abkürzungen', () => {
 });
 
 test('pickStopMatch: Bahnhof wird eindeutig erkannt (Bus-Halt "Bahnhof" daneben zählt als derselbe)', () => {
-  const r = pickStopMatch('grabenNeudorf', STOPS.grabenNeudorf, MATCHES['Graben-Neudorf']);
+  const r = pickStopMatch('grabenNeudorf', STOPS.grabenNeudorf, MATCHES['Graben-Neudorf Bahnhof']);
   assert.equal(r.status, 'ok');
   assert.equal(r.id, 'de:08215:2000');
 });
@@ -128,7 +130,7 @@ test('nextStopOfTrip: nächster Halt nach jetzt', () => {
 
 test('planJourney Hinweg: Kombinationen, Rad-Zeitversatz, Rangliste, mehrdeutige Haltestelle', async () => {
   const { client, calls } = createFakeClient();
-  const stops = await resolveStops(client, STOPS);
+  const stops = await resolveStops(client, GEO_STOPS);
   assert.equal(stops.oftersheim.status, 'ambiguous');
   assert.equal(stops.home.id, 'de:08215:1001');
 
@@ -165,7 +167,7 @@ test('planJourney Hinweg: Kombinationen, Rad-Zeitversatz, Rangliste, mehrdeutige
 
 test('planJourney: Weg B ohne Ergebnis zur Arbeit → Schätzung ab Wiesloch-Walldorf (+15 Min.)', async () => {
   const { client } = createFakeClient({ emptyTo: ['de:08226:8000', 'de:08226:9000'] });
-  const stops = await resolveStops(client, STOPS);
+  const stops = await resolveStops(client, GEO_STOPS);
   const { connections } = await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
   const b = connections.filter((c) => c.comboId.endsWith('+B'));
   assert.ok(b.length > 0);
@@ -176,7 +178,7 @@ test('planJourney: Weg B ohne Ergebnis zur Arbeit → Schätzung ab Wiesloch-Wal
 
 test('planJourney GPS: Start mit Koordinaten, Graben-Neudorf liegt hinter mir', async () => {
   const { client, calls } = createFakeClient();
-  const stops = await resolveStops(client, STOPS);
+  const stops = await resolveStops(client, GEO_STOPS);
   // Standort bei Waghäusel (zwischen Graben-Neudorf und Neulußheim)
   await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, start: { type: 'gps', lat: 49.25, lon: 8.52 }, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
   const plans = calls.filter((c) => c.type === 'plan');
@@ -187,8 +189,38 @@ test('planJourney GPS: Start mit Koordinaten, Graben-Neudorf liegt hinter mir', 
 
 test('planJourney: API-Fehler einer Variante bricht den Rest nicht ab', async () => {
   const { client } = createFakeClient({ failVia: ['de:08226:6000'] });
-  const stops = await resolveStops(client, STOPS);
+  const stops = await resolveStops(client, GEO_STOPS);
   const { results } = await planJourney({ client, journey: RETURN, stops, rules: RULES, now: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
   assert.ok(results.some((r) => r.status === 'error' && /500/.test(r.error)));
   assert.ok(results.some((r) => r.status === 'ok'));
+});
+
+test('fitsVariant: "über Neulußheim" nur mit echtem Bus-Umstieg dort (Durchfahren zählt nicht)', () => {
+  const combo = buildCombinations(OUTBOUND).find((c) => c.id === 'bike+A1');
+  const stops = { neulussheim: { key: 'neulussheim', id: 'de-DELFI_de:08226:3101', expected: 'Neulußheim', name: 'Neulußheim, Bahnhof' } };
+  const leg = (mode, from, to) => ({ mode, from: { name: from.n, stopId: from.id }, to: { name: to.n, stopId: to.id } });
+  const gn = { n: 'Graben-Neudorf Bahnhof', id: 'x:gn' };
+  const neul = { n: 'Neulußheim, Bahnhof', id: 'de-DELFI_de:08226:3101:1:2' }; // Bahnsteig-ID
+  const neulBus = { n: 'Neulußheim, Bahnhof', id: 'de-DELFI_de:08226:3101:0:1' };
+  const hock = { n: 'Hockenheim, Bahnhof', id: 'x:hock' };
+  const work = { n: 'Walldorf, Industriestr.', id: 'x:work' };
+  const viaBus = { legs: [leg('SUBURBAN', gn, neul), leg('WALK', neul, neulBus), leg('BUS', neulBus, work)] };
+  const throughTrain = { legs: [leg('SUBURBAN', gn, hock), leg('BUS', hock, work)] };
+  assert.equal(fitsVariant(viaBus, combo, stops), true);
+  assert.equal(fitsVariant(throughTrain, combo, stops), false);
+});
+
+test('planJourney: Via-Halte mit Mindestaufenthalt (erzwingt Aussteigen)', async () => {
+  const { client, calls } = createFakeClient();
+  const stops = await resolveStops(client, GEO_STOPS);
+  await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  const p = calls.find((c) => c.type === 'plan' && c.via.length === 2);
+  assert.deepEqual(p.viaMinimumStay, [RULES.viaMinimumStayMinutes, RULES.viaMinimumStayMinutes]);
+});
+
+test('resolveStops: feste IDs aus config.js → kein Geocoding', async () => {
+  const { client, calls } = createFakeClient();
+  const stops = await resolveStops(client, STOPS);
+  assert.equal(calls.length, 0);
+  assert.ok(Object.values(stops).every((s) => s.status === 'ok' && s.source === 'config'));
 });

@@ -35,7 +35,7 @@
  * @property {string[]} via
  * @property {FixedPart|null} fixedBefore
  * @property {FixedPart|null} fixedAfter
- * @property {string[]} criticalTransfers
+ * @property {string[]} busTransferAt
  * @property {{to:string, minutes:number, label:string}|null} fallback
  * @property {boolean} usesBike
  */
@@ -143,6 +143,7 @@ export function pickStopMatch(key, cfg, matches) {
 
   const candidates = (matches ?? [])
     .filter((m) => !m.type || m.type === 'STOP')
+    .filter(hasTransit)
     .map((m) => {
       const areaNames = (m.areas ?? []).map((a) => a.name);
       const all = new Set([...tokens(m.name), ...areaNames.flatMap(tokens)]);
@@ -172,6 +173,12 @@ export function pickStopMatch(key, cfg, matches) {
   }
   const c = pool[0];
   return { ...base, status: 'ok', source: 'geocode', id: c.m.id, name: c.m.name, area: c.area, lat: c.m.lat, lon: c.m.lon };
+}
+
+/** Nur Halte mit Bus/Bahn – Transitous enthält auch Mitfahr- und Parkpunkte (z. B. Quelle "amarillo"). */
+function hasTransit(m) {
+  if (!m.modes) return true;
+  return m.modes.some((x) => !['RIDE_SHARING', 'ODM', 'FLEX', 'CAR', 'BIKE', 'WALK', 'RENTAL'].includes(x));
 }
 
 function coreTokens(tok, placeTok) {
@@ -233,7 +240,7 @@ export function buildCombinations(journey) {
         via,
         fixedBefore: s1.fixedBefore ?? s2.fixedBefore ?? null,
         fixedAfter: s2.fixedAfter ?? s1.fixedAfter ?? null,
-        criticalTransfers: [...(s1.criticalTransfers ?? []), ...(s2.criticalTransfers ?? [])],
+        busTransferAt: [...(s1.busTransferAt ?? []), ...(s2.busTransferAt ?? [])],
         fallback: s2.fallback ?? s1.fallback ?? null,
         usesBike: [s1.fixedBefore, s2.fixedBefore, s1.fixedAfter, s2.fixedAfter].some((f) => f?.mode === 'bike'),
       });
@@ -259,10 +266,11 @@ export function combinationsEnRoute(combos, isPassed) {
       ...c,
       from: [],
       via: c.via.filter((v) => !isPassed(v)),
+      busTransferAt: c.busTransferAt.filter((v) => !isPassed(v)),
       fixedBefore: null,
       usesBike: c.fixedAfter?.mode === 'bike',
     };
-    const sig = JSON.stringify([adapted.via, adapted.to, adapted.fixedAfter, adapted.fallback]);
+    const sig = JSON.stringify([adapted.via, adapted.to, adapted.fixedAfter, adapted.fallback, adapted.busTransferAt]);
     if (!groups.has(sig)) groups.set(sig, []);
     groups.get(sig).push(adapted);
   }
@@ -277,7 +285,6 @@ export function combinationsEnRoute(combos, isPassed) {
       ...first,
       id: group.map((g) => g.id).join('|'),
       name,
-      criticalTransfers: [...new Set(group.flatMap((g) => g.criticalTransfers))],
     };
   });
 }
@@ -347,9 +354,13 @@ export function mergeItineraries(itineraries, limit, notBefore = 0) {
     const first = (it.legs ?? []).find((l) => isTransitMode(l.mode));
     if (!first) continue; // reine Fußwege ignorieren
     if (ms(first.startTime) < notBefore - MIN) continue;
-    const key = `${first.tripId ?? first.routeShortName}@${first.scheduledStartTime}`;
+    // Gleiche Fahrt ab zwei Arbeits-Haltestellen = eine Verbindung. Behalten: frühere Ankunft,
+    // bei Gleichstand spätere Abfahrt (weniger Warten/Laufen).
+    const key = first.tripId ?? `${first.routeShortName}@${first.scheduledStartTime}`;
     const prev = byFirstTrip.get(key);
-    if (!prev || ms(it.endTime) < ms(prev.endTime)) byFirstTrip.set(key, it);
+    const better = !prev || ms(it.endTime) < ms(prev.endTime) ||
+      (ms(it.endTime) === ms(prev.endTime) && ms(it.startTime) > ms(prev.startTime));
+    if (better) byFirstTrip.set(key, it);
   }
   return [...byFirstTrip.values()]
     .sort((a, b) => firstTransitStart(a) - firstTransitStart(b))
@@ -393,7 +404,10 @@ export function toDisplayLeg(l) {
  */
 export function placeMatchesStop(place, stop) {
   if (!stop || !place) return false;
-  if (stop.id && (place.stopId === stop.id || place.parentId === stop.id)) return true;
+  if (stop.id && place.stopId) {
+    // DELFI-Bahnsteig-IDs hängen an der Stations-ID: "de:08226:3101:1:2" gehört zu "de:08226:3101"
+    if (place.stopId === stop.id || place.parentId === stop.id || place.stopId.startsWith(`${stop.id}:`)) return true;
+  }
   const want = tokens(stop.expected ?? stop.name).filter((t) => !STATION_WORDS.has(t));
   const have = new Set(tokens(place.name));
   return want.length > 0 && want.every((t) => have.has(t));
@@ -445,6 +459,29 @@ export function overallRisk(risks) {
   return 'ok';
 }
 
+const isBus = (mode) => mode === 'BUS' || mode === 'COACH';
+
+/**
+ * Passt das Itinerary zur Variante? An jedem busTransferAt-Halt muss zwischen Bus und Bahn umgestiegen
+ * werden. Nötig, weil der Router sonst z. B. "über Neulußheim" mit einer S-Bahn erfüllt, die dort nur hält.
+ * @param {any} it  MOTIS-Itinerary
+ * @param {Combination} combo
+ * @param {Record<string, ResolvedStop>} stops
+ */
+export function fitsVariant(it, combo, stops) {
+  const t = (it.legs ?? []).filter((l) => isTransitMode(l.mode));
+  return combo.busTransferAt.every((key) => {
+    const stop = stops[key];
+    if (!stop) return false;
+    for (let i = 1; i < t.length; i++) {
+      const [a, b] = [t[i - 1], t[i]];
+      const mixed = isBus(a.mode) !== isBus(b.mode);
+      if (mixed && (placeMatchesStop(a.to, stop) || placeMatchesStop(b.from, stop))) return true;
+    }
+    return false;
+  });
+}
+
 /**
  * Wandelt ein MOTIS-Itinerary in eine bewertete Verbindung um (inkl. fester Anteile und Schätzung).
  *
@@ -489,7 +526,7 @@ export function analyzeItinerary(it, combo, stops, rules, estimate = null) {
     scheduledEnd += f.minutes * MIN;
   }
 
-  const criticalStops = combo.criticalTransfers.map((k) => stops[k]).filter(Boolean);
+  const criticalStops = combo.busTransferAt.map((k) => stops[k]).filter(Boolean);
   const risks = analyzeTransfers(legs, criticalStops, rules.tightTransferMinutes);
   const rtCount = transit.filter((l) => l.realTime).length;
 
@@ -528,7 +565,7 @@ function fixedLeg(f, start, end) {
 }
 
 /**
- * Gemeinsame Rangliste: nach voraussichtlicher Ankunft, bei Gleichstand spätere Abfahrt
+ * Gemeinsame Rangliste (ohne Duplikate): nach voraussichtlicher Ankunft, bei Gleichstand spätere Abfahrt
  * (weniger Wartezeit), dann weniger Umstiege. Ausgefallene/verpasste Anschlüsse ans Ende.
  * Markiert die beste Verbindung mit best = true.
  * @param {Connection[]} list
@@ -536,7 +573,15 @@ function fixedLeg(f, start, end) {
  */
 export function rankConnections(list) {
   const broken = (c) => c.cancelled || c.riskLevel === 'missed';
-  const sorted = [...list].sort(
+  // Identische Fahrten aus verschiedenen Varianten nur einmal zeigen (z. B. unterwegs, wenn Via-Halte wegfallen)
+  const seen = new Set();
+  const unique = list.filter((c) => {
+    const key = `${(c.legs ?? []).filter((l) => l.kind === 'transit').map((l) => l.tripId ?? l.line).join('>')}|${c.arrival}`;
+    if (c.legs?.length && seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const sorted = unique.sort(
     (a, b) => Number(broken(a)) - Number(broken(b)) ||
       a.arrival - b.arrival ||
       b.departure - a.departure ||

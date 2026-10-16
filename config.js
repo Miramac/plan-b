@@ -16,15 +16,18 @@
 
 /** @type {Record<string, StopConfig>} */
 export const STOPS = {
-  home:             { name: 'Hochstetten Waldstraße', place: 'Linkenheim-Hochstetten', id: null },
-  grabenNeudorf:    { name: 'Graben-Neudorf', place: 'Graben-Neudorf', rail: true, id: null },
-  bruchsal:         { name: 'Bruchsal', place: 'Bruchsal', rail: true, id: null },
-  wieslochWalldorf: { name: 'Wiesloch-Walldorf', place: 'Walldorf', query: 'Wiesloch-Walldorf Bahnhof', rail: true, id: null },
-  neulussheim:      { name: 'Neulußheim', place: 'Neulußheim', rail: true, id: null },
-  hockenheim:       { name: 'Hockenheim', place: 'Hockenheim', rail: true, id: null },
-  oftersheim:       { name: 'Oftersheim', place: 'Oftersheim', rail: true, id: null },
-  workIndustrie:    { name: 'Industriestraße', place: 'Walldorf', id: null },
-  workHdm:          { name: 'HDM Philipp-Reis-Straße', place: 'Walldorf', id: null },
+  // IDs per Transitous-Geocoding ermittelt und geprüft (Stand 16.10.2026).
+  // Setzt du id: null, sucht die App die Haltestelle wieder selbst über name + place.
+  home:             { name: 'Hochstetten Waldstraße', place: 'Linkenheim-Hochstetten', id: 'de-KVV_Pde:08215:7702', lat: 49.13485, lon: 8.4224 },
+  grabenNeudorf:    { name: 'Graben-Neudorf', place: 'Graben-Neudorf', query: 'Graben-Neudorf Bahnhof', rail: true, id: 'de-DELFI_de:08215:32585', lat: 49.16207, lon: 8.49069 },
+  bruchsal:         { name: 'Bruchsal', place: 'Bruchsal', rail: true, id: 'de-DELFI_de:08215:1856', lat: 49.12462, lon: 8.58965 },
+  wieslochWalldorf: { name: 'Wiesloch-Walldorf', place: 'Wiesloch', query: 'Wiesloch-Walldorf Bahnhof', rail: true, id: 'de-DELFI_de:08226:4252_G', lat: 49.29135, lon: 8.66415 },
+  neulussheim:      { name: 'Neulußheim', place: 'Neulußheim', rail: true, id: 'de-DELFI_de:08226:3101', lat: 49.29295, lon: 8.53067 },
+  hockenheim:       { name: 'Hockenheim', place: 'Hockenheim', rail: true, id: 'de-DELFI_de:08226:1620', lat: 49.31741, lon: 8.53738 },
+  oftersheim:       { name: 'Oftersheim', place: 'Oftersheim', rail: true, id: 'de-DELFI_de:08226:3285', lat: 49.37335, lon: 8.57899 },
+  // Bushalte: ID eines Steigs, die API berücksichtigt beide Fahrtrichtungen
+  workIndustrie:    { name: 'Industriestraße', place: 'Walldorf', id: 'de-DELFI_de:08226:4277:0:1', lat: 49.29276, lon: 8.64824 },
+  workHdm:          { name: 'HDM Philipp-Reis-Straße', place: 'Walldorf', id: 'de-DELFI_de:08226:4023:0:RiO', lat: 49.2898, lon: 8.65166 },
 };
 
 /** Beide Arbeits-Haltestellen sind gleichwertig – es wird zu/ab beiden gesucht. */
@@ -48,7 +51,8 @@ const WORK = ['workIndustrie', 'workHdm'];
  * @property {string[]} [via]               Via-Halte in Fahrtreihenfolge
  * @property {FixedPart} [fixedBefore]      Fester Anteil VOR der ÖPNV-Suche (Suche startet jetzt + minutes)
  * @property {FixedPart} [fixedAfter]       Fester Anteil NACH der ÖPNV-Fahrt
- * @property {string[]} [criticalTransfers] Umstiege an diesen Halten sind kritisch (Bus nur 1x pro Stunde)
+ * @property {string[]} [busTransferAt]  Hier MUSS zwischen Bus und Bahn umgestiegen werden (sonst wird die
+ *                                        Verbindung verworfen). Der Bus fährt nur 1x pro Stunde → Umstieg ist kritisch.
  * @property {{to: string, minutes: number, label: string}} [fallback]
  *           Liefert die API zum Ziel nichts: bis fallback.to suchen und minutes als Schätzung aufschlagen.
  *
@@ -72,9 +76,9 @@ export const OUTBOUND = {
     },
   ],
   stage2: [
-    { key: 'A1', name: 'S9 + Bus über Neulußheim', via: ['neulussheim'], to: WORK, criticalTransfers: ['neulussheim'] },
-    { key: 'A2', name: 'S9 + Bus über Hockenheim', via: ['hockenheim'], to: WORK, criticalTransfers: ['hockenheim'] },
-    { key: 'A3', name: 'S9 + Bus über Oftersheim', via: ['oftersheim'], to: WORK, criticalTransfers: ['oftersheim'] },
+    { key: 'A1', name: 'S9 + Bus über Neulußheim', via: ['neulussheim'], to: WORK, busTransferAt: ['neulussheim'] },
+    { key: 'A2', name: 'S9 + Bus über Hockenheim', via: ['hockenheim'], to: WORK, busTransferAt: ['hockenheim'] },
+    { key: 'A3', name: 'S9 + Bus über Oftersheim', via: ['oftersheim'], to: WORK, busTransferAt: ['oftersheim'] },
     {
       key: 'B', name: 'S33 + S-Bahn über Bruchsal/Wiesloch-Walldorf', via: ['bruchsal'], to: WORK,
       fallback: { to: 'wieslochWalldorf', minutes: 15, label: 'Bus ab Wiesloch-Walldorf (geschätzt, max. 15 Min.)' },
@@ -87,9 +91,9 @@ export const RETURN = {
   key: 'return',
   label: 'Nach Hause',
   stage1: [
-    { key: 'A1', name: 'Bus + S9 über Neulußheim', from: WORK, via: ['neulussheim'], criticalTransfers: ['neulussheim'] },
-    { key: 'A2', name: 'Bus + S9 über Hockenheim', from: WORK, via: ['hockenheim'], criticalTransfers: ['hockenheim'] },
-    { key: 'A3', name: 'Bus + S9 über Oftersheim', from: WORK, via: ['oftersheim'], criticalTransfers: ['oftersheim'] },
+    { key: 'A1', name: 'Bus + S9 über Neulußheim', from: WORK, via: ['neulussheim'], busTransferAt: ['neulussheim'] },
+    { key: 'A2', name: 'Bus + S9 über Hockenheim', from: WORK, via: ['hockenheim'], busTransferAt: ['hockenheim'] },
+    { key: 'A3', name: 'Bus + S9 über Oftersheim', from: WORK, via: ['oftersheim'], busTransferAt: ['oftersheim'] },
     {
       key: 'B', name: 'Fußweg + S-Bahn über Wiesloch-Walldorf/Bruchsal',
       from: ['wieslochWalldorf'], via: ['bruchsal'],
@@ -108,6 +112,7 @@ export const RETURN = {
 /** Umstiegs- und Abfrage-Parameter */
 export const RULES = {
   tightTransferMinutes: 5, // Puffer darunter = "knapp"
+  viaMinimumStayMinutes: 1, // erzwingt Aussteigen am Via-Halt (bei 0 zählt auch Durchfahren)
   connectionsPerVariant: 3, // nächste N Verbindungen je Kombination
   maxParallelRequests: 4, // schont die Transitous-API
   autoRefreshMinutes: 3, // Unterwegs-Modus
@@ -116,8 +121,8 @@ export const RULES = {
 
 /** Wetter (Open-Meteo) für Linkenheim-Hochstetten */
 export const WEATHER = {
-  lat: 49.118,
-  lon: 8.415,
+  lat: 49.135,
+  lon: 8.422,
   goodBikeWeather: {
     maxPrecipitationMm: 0.2, // mm/h, darunter ok
     minTemperatureC: 5, // °C, darüber ok

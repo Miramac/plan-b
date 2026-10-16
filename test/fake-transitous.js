@@ -8,13 +8,13 @@ export const MATCHES = {
     match('de:08215:1001', 'Hochstetten Waldstraße', 'Linkenheim-Hochstetten', 49.12, 8.42, ['BUS']),
     match('de:08215:1002', 'Hochstetten Rathaus', 'Linkenheim-Hochstetten', 49.125, 8.42, ['BUS']),
   ],
-  'Graben-Neudorf': [
+  'Graben-Neudorf Bahnhof': [
     match('de:08215:2000', 'Graben-Neudorf', 'Graben-Neudorf', 49.165, 8.49, ['SUBURBAN', 'REGIONAL_RAIL']),
     match('de:08215:2001', 'Graben-Neudorf Bahnhof', 'Graben-Neudorf', 49.1652, 8.4902, ['BUS']),
     match('de:08215:2002', 'Graben-Neudorf Rathaus', 'Graben-Neudorf', 49.17, 8.50, ['BUS']),
   ],
   Bruchsal: [match('de:08215:3000', 'Bruchsal', 'Bruchsal', 49.124, 8.59, ['REGIONAL_RAIL'])],
-  'Wiesloch-Walldorf Bahnhof': [match('de:08226:4000', 'Wiesloch-Walldorf', 'Walldorf', 49.29, 8.66, ['SUBURBAN'])],
+  'Wiesloch-Walldorf Bahnhof': [match('de:08226:4000', 'Wiesloch-Walldorf, Bf', 'Wiesloch', 49.29, 8.66, ['SUBURBAN', 'BUS'])],
   Neulußheim: [match('de:08226:5000', 'Neulußheim', 'Neulußheim', 49.29, 8.52, ['SUBURBAN'])],
   Hockenheim: [match('de:08226:6000', 'Hockenheim', 'Hockenheim', 49.32, 8.55, ['SUBURBAN'])],
   // Absichtlich mehrdeutig: zwei verschiedene Halte, keiner heißt exakt "Oftersheim"
@@ -30,6 +30,7 @@ function match(id, name, area, lat, lon, modes) {
   return { type: 'STOP', id, name, lat, lon, modes, tokens: [], score: 1, areas: [{ name: area, adminLevel: 8, matched: true, default: true }] };
 }
 
+const BUS_STOPS = ['de:08215:1001', 'de:08226:8000', 'de:08226:9000'];
 const NAMES = Object.fromEntries(Object.values(MATCHES).flat().map((m) => [m.id, m.name]));
 
 /**
@@ -46,7 +47,8 @@ function itinerary(stopIds, start, { delayMin = 0, realTime = true } = {}) {
     const arr = dep + 15 * MIN;
     const d = i === 0 ? delayMin * MIN : 0;
     legs.push({
-      mode: i === stopIds.length - 2 && to.includes('08226:') && !to.endsWith('4000') ? 'BUS' : 'SUBURBAN',
+      // Bus von/zu Zuhause und Arbeit, sonst S-Bahn (wie in echt)
+      mode: [from, to].some((id) => BUS_STOPS.includes(id)) ? 'BUS' : 'SUBURBAN',
       from: { name: NAMES[from] ?? from, stopId: from, lat: 0, lon: 0 },
       to: { name: NAMES[to] ?? to, stopId: to, lat: 0, lon: 0 },
       startTime: new Date(dep + d).toISOString(),
