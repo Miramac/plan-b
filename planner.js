@@ -4,7 +4,7 @@
 import {
   pickStopMatch, buildCombinations, combinationsEnRoute, buildQueries, mergeItineraries,
   analyzeItinerary, fitsVariant, meetsMinBuffer, meetsStartBuffer, exceptionMinutes, withoutTransferReserve,
-  itineraryKey, rankConnections, forDeparture, weatherAt, isViaBehind, placeMatchesStop,
+  itineraryKey, rankConnections, forDeparture, touchesAvoidedStation, weatherAt, isViaBehind, placeMatchesStop,
   nextStopOfTrip, currentTransitLeg, tokens, recentDepartures, upcomingStops, tripSequence,
 } from './logic.js';
 
@@ -32,7 +32,7 @@ import {
  * @property {'ok'|'empty'|'error'|'late'} status   late = nur Abfahrten deutlich nach der gewünschten Zeit
  * @property {number} [nextDeparture]              bei late: früheste Abfahrt
  * @property {string} [error]
- * @property {{variant: number, buffer: number}} [dropped]  verworfene Verbindungen (falsche Route / zu knapper Umstieg), je Fahrtenfolge gezählt
+ * @property {{variant: number, buffer: number, avoid: number}} [dropped]  verworfene Verbindungen (falsche Route / zu knapper Umstieg), je Fahrtenfolge gezählt
  * @property {Connection[]} connections
  */
 
@@ -301,6 +301,7 @@ async function runCombination({ client, combo, stops, rules, now, startInfo, rea
       viaMinimumStay: q.via.map(() => rules.viaMinimumStayMinutes),
       additionalTransferTime: v.reserve,
       realtimeMode: v.realtimeMode,
+      transitModes: rules.transitModes,
       numItineraries: rules.itinerariesPerQuery ?? rules.connectionsPerVariant,
     });
     return { ...res, itineraries: (res.itineraries ?? []).map((it) => withoutTransferReserve(it, v.reserve)) };
@@ -308,11 +309,12 @@ async function runCombination({ client, combo, stops, rules, now, startInfo, rea
 
   // Nur Verbindungen behalten, die zur Variante passen (Bus-Umstieg am richtigen Bahnhof)
   // und keinen zu knappen Umstieg laut Fahrplan haben – auch nicht am Unterwegs-Start.
-  const dropped = { variant: new Set(), buffer: new Set() };
+  const dropped = { variant: new Set(), buffer: new Set(), avoid: new Set() };
   const collect = (settled) => settled
     .filter((s) => s.status === 'fulfilled')
     .flatMap((s) => s.value.itineraries ?? [])
     .filter((it) => {
+      if (touchesAvoidedStation(it, rules.avoidStations)) { dropped.avoid.add(itineraryKey(it)); return false; }
       if (!fitsVariant(it, combo, stops)) { dropped.variant.add(itineraryKey(it)); return false; }
       if (!meetsMinBuffer(it, combo, stops, rules) || !meetsStartBuffer(it, startInfo?.trip, combo, stops, rules)) {
         dropped.buffer.add(itineraryKey(it));
@@ -352,6 +354,6 @@ async function runCombination({ client, combo, stops, rules, now, startInfo, rea
     combo,
     status: connections.length ? 'ok' : 'empty',
     connections,
-    dropped: { variant: dropped.variant.size, buffer: dropped.buffer.size },
+    dropped: { variant: dropped.variant.size, buffer: dropped.buffer.size, avoid: dropped.avoid.size },
   };
 }

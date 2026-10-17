@@ -122,6 +122,10 @@ export const RULES = {
   minBufferMinutes: 3, // Umstiege mit weniger Puffer (laut Fahrplan) nie nutzen – Ausnahmen: minBufferAt
   tightTransferMinutes: 5, // Puffer darunter = "knapp" (inkl. Echtzeit)
   viaMinimumStayMinutes: 1, // erzwingt Aussteigen am Via-Halt (bei 0 zählt auch Durchfahren)
+  // Nur Nahverkehr: kein ICE/IC/EC, keine Nachtzüge, keine Fernbusse (Positivliste für die Routensuche)
+  transitModes: ['REGIONAL_RAIL', 'SUBURBAN', 'SUBWAY', 'TRAM', 'BUS', 'ODM', 'FERRY'],
+  // Nie über diese Bahnhöfe – auch nicht durchfahren. code = Stationsnummer aus der DHID
+  avoidStations: [{ code: 'de:08212:90', names: ['Karlsruhe Hbf', 'Karlsruhe Hauptbahnhof'] }],
   connectionsPerVariant: 3, // unterwegs: nächste N Verbindungen je Kombination (Alternativen)
   // Normale Suche (Jetzt / Gewohnt / Uhrzeit): Abfahrtszeit steht fest → je Variante nur die beste Verbindung,
   // die höchstens maxWaitMinutes nach der gewünschten Abfahrt startet. Spätere Abfahrten werden ausgeblendet.

@@ -93,7 +93,8 @@ export function createTransitousClient({ baseUrl, maxParallel = 4, fetchImpl = g
      * viaMinimumStay: Mindestaufenthalt je Via-Halt in Minuten (0 = Durchfahren reicht, ≥1 = aussteigen).
      * additionalTransferTime: Reserve je Umstieg in Minuten (MOTIS verlängert damit die Umstiegs-Fußwege).
      * realtimeMode: 'REALTIME' (Standard) oder 'REALTIME_ANNOTATION_ONLY' (Routing nach Fahrplan, Echtzeit nur als Info).
-     * @param {PlanQuery & {numItineraries?: number, viaMinimumStay?: number[], additionalTransferTime?: number, realtimeMode?: string}} q
+     * transitModes: erlaubte Verkehrsmittel (z. B. ohne HIGHSPEED_RAIL/LONG_DISTANCE), Standard: alle.
+     * @param {PlanQuery & {numItineraries?: number, viaMinimumStay?: number[], additionalTransferTime?: number, realtimeMode?: string, transitModes?: string[]}} q
      * @returns {Promise<{itineraries: any[]}>}
      */
     plan(q) {
@@ -107,6 +108,7 @@ export function createTransitousClient({ baseUrl, maxParallel = 4, fetchImpl = g
         maxPreTransitTime: q.maxPreTransitTime,
         additionalTransferTime: q.additionalTransferTime,
         realtimeMode: q.realtimeMode,
+        transitModes: q.transitModes?.length ? q.transitModes.join(',') : undefined,
         detailedTransfers: false,
         language: 'de',
       });

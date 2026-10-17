@@ -10,7 +10,7 @@ import {
   recentDepartures, nearestStopKey, upcomingStops, groupByExit, analyzeItinerary, nextStopOfTrip as nextStop, combinationsEnRoute as enRoute, nextStep, recommendationChanged, recommendationKey, nextStopOfTrip,
 } from '../logic.js';
 import { resolveStops, planJourney, locateInTrip } from '../planner.js';
-import { placeMatchesStop, stationCode } from '../logic.js';
+import { placeMatchesStop, stationCode, touchesAvoidedStation } from '../logic.js';
 import { createFakeClient, MATCHES } from './fake-transitous.js';
 
 const MIN = 60_000;
@@ -552,4 +552,26 @@ test('planJourney unterwegs: Alternativen bleiben erhalten (kein Zeitfenster)', 
   const stops = await resolveStops(client, GEO_STOPS);
   const { results } = await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, start: { type: 'gps', lat: 49.25, lon: 8.52 }, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
   assert.ok(results.some((r) => r.connections.length > 1));
+});
+
+test('touchesAvoidedStation: Karlsruhe Hbf als Umstieg oder Durchfahrt wird erkannt', () => {
+  const avoid = RULES.avoidStations;
+  const ka = { name: 'Karlsruhe Hauptbahnhof', stopId: 'de-DELFI_de:08212:90:3:3' };
+  const viaKa = { legs: [{ mode: 'SUBURBAN', from: { name: 'GN', stopId: 'de-DELFI_de:08215:32585' }, to: ka }, { mode: 'REGIONAL_RAIL', from: ka, to: { name: 'Bruchsal', stopId: 'de-DELFI_de:08215:1856' } }] };
+  const through = { legs: [{ mode: 'SUBURBAN', from: { name: 'Blankenloch', stopId: 'x:1' }, to: { name: 'Durlach', stopId: 'x:2' }, intermediateStops: [ka] }] };
+  const direct = { legs: [{ mode: 'SUBURBAN', from: { name: 'GN', stopId: 'de-DELFI_de:08215:32585' }, to: { name: 'Bruchsal', stopId: 'de-DELFI_de:08215:1856' }, intermediateStops: [{ name: 'Karlsdorf Bahnhof', stopId: 'de-DELFI_de:08215:9' }] }] };
+  const walkOnly = { legs: [{ mode: 'WALK', from: ka, to: ka }] };
+  assert.equal(touchesAvoidedStation(viaKa, avoid), true);
+  assert.equal(touchesAvoidedStation(through, avoid), true);
+  assert.equal(touchesAvoidedStation(direct, avoid), false);
+  assert.equal(touchesAvoidedStation(walkOnly, avoid), false);
+  assert.equal(touchesAvoidedStation({ legs: [{ mode: 'BUS', from: { name: 'Karlsruhe Hbf' }, to: { name: 'X' } }] }, avoid), true); // ohne ID: Name
+});
+
+test('planJourney: nur Nahverkehr wird angefragt (kein ICE/IC)', async () => {
+  const { client, calls } = createFakeClient();
+  const stops = await resolveStops(client, GEO_STOPS);
+  await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  const plans = calls.filter((c) => c.type === 'plan');
+  assert.ok(plans.every((p) => !p.transitModes.includes('HIGHSPEED_RAIL') && !p.transitModes.includes('LONG_DISTANCE')));
 });

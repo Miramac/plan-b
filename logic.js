@@ -639,6 +639,22 @@ export function fitsVariant(it, combo, stops) {
 }
 
 /**
+ * Berührt die Verbindung einen gemiedenen Bahnhof (Ein-/Aus-/Umstieg oder Durchfahrt)?
+ * @param {any} it  MOTIS-Itinerary
+ * @param {Array<{code?: string, names?: string[]}>} avoid
+ */
+export function touchesAvoidedStation(it, avoid) {
+  if (!avoid?.length) return false;
+  const codes = new Set(avoid.map((a) => a.code).filter(Boolean));
+  const names = new Set(avoid.flatMap((a) => a.names ?? []).map(normalize));
+  const hit = (p) => {
+    const code = stationCode(p?.stopId);
+    return code ? codes.has(code) : names.has(normalize(p?.name));
+  };
+  return (it.legs ?? []).some((l) => isTransitMode(l.mode) && [l.from, l.to, ...(l.intermediateStops ?? [])].some(hit));
+}
+
+/**
  * Wandelt ein MOTIS-Itinerary in eine bewertete Verbindung um (inkl. fester Anteile und Schätzung).
  *
  * @param {any} it

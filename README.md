@@ -58,6 +58,7 @@ Die Transitous-IDs sind fest in `config.js → STOPS` eingetragen, ermittelt per
   - Fällt trotzdem etwas wegen zu knapper Umstiege weg (Umstieg außerhalb der Via-Halte), folgt eine zweite Abfrage mit voller Reserve.
 - **Verspätungen:** Bei „Jetzt“ und unterwegs fragt die App zusätzlich mit `realtimeMode=REALTIME_ANNOTATION_ONLY` ab (Routing nach Fahrplan, Echtzeit nur als Info). Eine Verspätung lässt eine Verbindung so nicht verschwinden, sondern markiert sie als „knapp“.
 - **Unterwegs:** Auch der Umstieg am nächsten Halt der aktuellen Fahrt wird gegen den Mindestpuffer geprüft; sitzen bleiben ist immer erlaubt. Haltestellen werden über die Stationsnummer der DHID verglichen (`de:08215:32585`), damit z. B. „Graben-Neudorf Nord“ nicht als „Graben-Neudorf“ gilt.
+- **Nur Nahverkehr, nie über Karlsruhe Hbf:** Die Routensuche erlaubt nur Regionalzug, S-Bahn, Straßenbahn, Bus und Rufbus (`RULES.transitModes`), also kein ICE/IC/EC und keine Fernbusse. Verbindungen, die Karlsruhe Hbf berühren, auch als Durchfahrt, werden verworfen (`RULES.avoidStations`).
 - **Rufbus:** On-Demand-Fahrten (`ODM`/`FLEX`) werden als Fahrt angezeigt und markiert („evtl. vorher anmelden“).
 - **Echtzeit:** Gibt es erst kurz vor der Fahrt. Abfragen für spätere Tage zeigen daher „keine Echtzeitdaten“.
 
