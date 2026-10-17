@@ -122,7 +122,7 @@ async function run(journeyKey, start, opts = {}) {
     // 1) Haltestellen auflösen (gecacht) und Wetter parallel holen
     const [stops, weather] = await Promise.all([
       resolveStops(client, STOPS, { cache: store, choices: store.get('choices') ?? {} }),
-      fetchWeather({ baseUrl: API.openMeteoBase, lat: WEATHER.lat, lon: WEATHER.lon }).catch((e) => {
+      weatherCached().catch((e) => {
         message('warn', `Wetter nicht verfügbar: ${esc(e.message)}`);
         return null;
       }),
@@ -140,6 +140,13 @@ async function run(journeyKey, start, opts = {}) {
     // 2) Alle Kombinationen parallel abfragen und gemeinsam sortieren
     const { connections, results } = await planJourney({
       client, journey, stops, rules: RULES, now, realNow, start, weather, weatherThresholds: WEATHER.goodBikeWeather,
+      // Teilergebnisse sofort zeigen, statt auf die langsamste Abfrage zu warten
+      onProgress: ({ connections: partial, finished, total }) => {
+        if (opts.session !== undefined && opts.session !== state.enRoute.session) return;
+        if (partial.length) renderResults(partial, [], !!start, realNow);
+        else $('#results').innerHTML = '';
+        $('#results').insertAdjacentHTML('beforeend', `<li class="loading"><span class="spinner"></span>${finished} von ${total} Varianten geladen …</li>`);
+      },
     });
     // Unterwegs beendet oder anderen Zug gewählt, während gesucht wurde → Ergebnis verwerfen
     if (opts.session !== undefined && (opts.session !== state.enRoute.session || !state.enRoute.active)) {
@@ -182,6 +189,15 @@ async function run(journeyKey, start, opts = {}) {
     state.enRoute.lastRun = Date.now();
     setBusy(false);
   }
+}
+
+/** Wetter höchstens alle 15 Min. neu laden (Open-Meteo ist manchmal überlastet). */
+async function weatherCached() {
+  const cached = store.get('weather');
+  if (cached && Date.now() - cached.at < 15 * 60_000) return cached.data;
+  const data = await fetchWeather({ baseUrl: API.openMeteoBase, lat: WEATHER.lat, lon: WEATHER.lon });
+  store.set('weather', { at: Date.now(), data });
+  return data;
 }
 
 /** Satz für "Neue Empfehlung: …" */

@@ -39,7 +39,7 @@ Für GPS (Unterwegs-Modus) muss die Seite über HTTPS (oder localhost) laufen.
 ## So funktioniert der Vergleich
 
 1. **Kombinationen:** Jede Option aus Etappe 1 wird mit jeder Option aus Etappe 2 kombiniert (Hinweg: Bus/Rad × A1/A2/A3/B = 8).
-2. **Abfrage:** Pro Kombination ein `GET /api/v6/plan` je Start-/Ziel-Haltestelle, mit `via` (z. B. Graben-Neudorf + Hockenheim). Feste Anteile (Rad, Fußweg) werden nicht geroutet: Die Suche startet am Bahnhof zur Zeit *jetzt + feste Dauer*.
+2. **Abfrage:** Pro Kombination ein `/api/v6/plan`; beide Arbeits-Haltestellen (alle Bussteige) stecken per `POST` mit `toOffsets`/`fromOffsets` in **einer** Abfrage, mit `via` (z. B. Graben-Neudorf + Hockenheim). Feste Anteile (Rad, Fußweg) werden nicht geroutet: Die Suche startet am Bahnhof zur Zeit *jetzt + feste Dauer*.
 3. **Auswertung:** Die nächsten 3 Verbindungen je Kombination. Ankunft inklusive Echtzeit, festen Anteilen und gegebenenfalls der 15-Minuten-Schätzung bei Weg B. Puffer je Umstieg, unter 5 Minuten „knapp“. An stündlichen Bus-Umstiegen gilt das als kritisch.
 4. **Rangliste:** Alle Verbindungen werden gemeinsam nach Ankunft sortiert. Die beste wird hervorgehoben.
 
@@ -64,4 +64,4 @@ Die Transitous-IDs sind fest in `config.js → STOPS` eingetragen, ermittelt per
 
 ## Nutzungsregeln Transitous
 
-Abfragen laufen nur auf Knopfdruck oder im Unterwegs-Modus (Auto-Update alle 3 Minuten, nur bei sichtbarer Seite). Maximal 4 Requests laufen parallel.
+Abfragen laufen nur auf Knopfdruck oder im Unterwegs-Modus (Auto-Update alle 3 Minuten, nur bei sichtbarer Seite). Maximal 6 Requests laufen parallel; eine normale Suche braucht etwa 9–11 Abfragen (~10 s, erste Ergebnisse nach ~4 s). Das Wetter wird 15 Minuten zwischengespeichert und bei Überlastung (503) einmal wiederholt.

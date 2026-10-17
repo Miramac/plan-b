@@ -35,12 +35,12 @@ function createLimiter(max) {
   return (fn) => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
 }
 
-async function getJson(fetchImpl, url, serviceName, timeoutMs = 20_000) {
+async function getJson(fetchImpl, url, serviceName, timeoutMs = 20_000, init = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   let res;
   try {
-    res = await fetchImpl(url, { signal: ctrl.signal, headers: { Accept: 'application/json' } });
+    res = await fetchImpl(url, { ...init, signal: ctrl.signal, headers: { Accept: 'application/json', ...(init.headers ?? {}) } });
   } catch (cause) {
     const msg = cause?.name === 'AbortError'
       ? `${serviceName} antwortet nicht (Zeitüberschreitung).`
@@ -71,12 +71,26 @@ const qs = (params) =>
   ).toString();
 
 /**
+ * Mehrere gleichwertige Start-/Ziel-Haltestellen in EINER Abfrage (POST /plan mit Offsets):
+ * z. B. Industriestraße und HDM Philipp-Reis-Straße – spart die Hälfte der Abfragen.
+ */
+function offsetsBody(q) {
+  const offsets = (ids) => ids.map((stopId) => ({ stopId, duration: 0 }));
+  if (!q.fromStops?.length && !q.toStops?.length) return undefined;
+  return {
+    ...(q.fromStops?.length ? { fromOffsets: offsets(q.fromStops) } : {}),
+    ...(q.toStops?.length ? { toOffsets: offsets(q.toStops) } : {}),
+  };
+}
+
+/**
  * Transitous-Client.
  * @param {{baseUrl: string, maxParallel?: number, fetchImpl?: typeof fetch}} opts
  */
 export function createTransitousClient({ baseUrl, maxParallel = 4, fetchImpl = globalThis.fetch.bind(globalThis) }) {
   const limit = createLimiter(maxParallel);
-  const call = (path, params) => limit(() => getJson(fetchImpl, `${baseUrl}${path}?${qs(params)}`, 'Transitous'));
+  const call = (path, params, body) => limit(() => getJson(fetchImpl, `${baseUrl}${path}?${qs(params)}`, 'Transitous', 20_000,
+    body ? { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } } : {}));
 
   return {
     /**
@@ -111,7 +125,7 @@ export function createTransitousClient({ baseUrl, maxParallel = 4, fetchImpl = g
         transitModes: q.transitModes?.length ? q.transitModes.join(',') : undefined,
         detailedTransfers: false,
         language: 'de',
-      });
+      }, offsetsBody(q));
     },
 
     /**
@@ -145,7 +159,15 @@ export async function fetchWeather({ baseUrl, lat, lon, fetchImpl = globalThis.f
     latitude: lat, longitude: lon, current: vars, hourly: vars,
     timeformat: 'unixtime', timezone: 'GMT', forecast_days: 7, wind_speed_unit: 'kmh',
   })}`;
-  const d = await getJson(fetchImpl, url, 'Open-Meteo');
+  let d;
+  try {
+    d = await getJson(fetchImpl, url, 'Open-Meteo');
+  } catch (e) {
+    // Open-Meteo ist gelegentlich überlastet (503) → einmal kurz warten und wiederholen
+    if (!(e.status >= 500)) throw e;
+    await new Promise((r) => setTimeout(r, 1500));
+    d = await getJson(fetchImpl, url, 'Open-Meteo');
+  }
   const point = (time, i, src) => ({
     time: time * 1000,
     temperature: i == null ? src.temperature_2m : src.temperature_2m[i],

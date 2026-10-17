@@ -88,9 +88,11 @@ export function createFakeClient({ emptyTo = [], failVia = [] } = {}) {
       async plan(q) {
         calls.push({ type: 'plan', ...q });
         if (q.via.some((v) => failVia.includes(v))) throw new Error('Transitous: Fehler 500');
-        if (emptyTo.includes(q.toPlace)) return { itineraries: [] };
-        const from = q.fromPlace.includes(',') ? 'gps' : q.fromPlace;
-        const seq = [from, ...q.via, q.toPlace];
+        const toPlace = q.toStops?.[0] ?? q.toPlace; // POST mit Offsets: erste Ziel-Haltestelle
+        const fromPlace = q.fromStops?.[0] ?? q.fromPlace;
+        if ((q.toStops ?? [q.toPlace]).every((t) => emptyTo.includes(t))) return { itineraries: [] };
+        const from = fromPlace.includes(',') ? 'gps' : fromPlace;
+        const seq = [from, ...q.via, toPlace];
         return {
           itineraries: [0, 20, 40].map((off, i) =>
             itinerary(seq, q.time + (5 + off) * MIN, { delayMin: i === 0 ? 2 : 0, realTime: i !== 2 })),

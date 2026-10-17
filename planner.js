@@ -3,7 +3,7 @@
 
 import {
   pickStopMatch, buildCombinations, combinationsEnRoute, buildQueries, mergeItineraries,
-  analyzeItinerary, fitsVariant, meetsMinBuffer, meetsStartBuffer, exceptionMinutes, withoutTransferReserve,
+  analyzeItinerary, trimOffsetWalks, fitsVariant, meetsMinBuffer, meetsStartBuffer, exceptionMinutes, withoutTransferReserve,
   itineraryKey, rankConnections, forDeparture, touchesAvoidedStation, weatherAt, isViaBehind, placeMatchesStop,
   nextStopOfTrip, currentTransitLeg, tokens, recentDepartures, upcomingStops, tripSequence,
 } from './logic.js';
@@ -56,7 +56,7 @@ export async function resolveStops(client, stopsCfg, { cache, choices = {} } = {
   const entries = await Promise.all(Object.entries(stopsCfg).map(async ([key, cfg]) => {
     const base = { key, expected: cfg.name, place: cfg.place };
     if (cfg.id) {
-      return [key, { ...base, status: 'ok', source: 'config', id: cfg.id, name: cfg.name, lat: cfg.lat, lon: cfg.lon }];
+      return [key, { ...base, status: 'ok', source: 'config', id: cfg.id, name: cfg.name, lat: cfg.lat, lon: cfg.lon, platforms: cfg.platforms }];
     }
     const sig = choiceSignature(cfg);
     const choice = choices[key];
@@ -225,9 +225,10 @@ export async function locateInConnection(client, conn, now) {
  * @param {EnRouteStart} [p.start]            Unterwegs-Startpunkt (GPS oder Fahrt)
  * @param {WeatherData|null} [p.weather]
  * @param {Object} [p.weatherThresholds]
+ * @param {(p: {connections: Connection[], finished: number, total: number}) => void} [p.onProgress]  Zwischenstand je fertiger Variante
  * @returns {Promise<{connections: Connection[], results: ComboResult[]}>}
  */
-export async function planJourney({ client, journey, stops, rules, now, realNow = now, start, weather, weatherThresholds }) {
+export async function planJourney({ client, journey, stops, rules, now, realNow = now, start, weather, weatherThresholds, onProgress }) {
   let combos = buildCombinations(journey);
   /** @type {{place: string, time?: number, maxPreTransitTime?: number}|undefined} */
   let startInfo;
@@ -246,7 +247,14 @@ export async function planJourney({ client, journey, stops, rules, now, realNow 
   }
 
   const realtimeNear = Math.abs(now - realNow) < 90 * 60_000;
-  const results = await Promise.all(combos.map((combo) => runCombination({ client, combo, stops, rules, now, startInfo, realtimeNear })));
+  // Jede Variante meldet sich, sobald sie fertig ist (onProgress) – die Seite kann so schon Teilergebnisse zeigen
+  const done = [];
+  const results = await Promise.all(combos.map((combo) => runCombination({ client, combo, stops, rules, now, startInfo, realtimeNear })
+    .then((r) => {
+      done.push(r);
+      onProgress?.({ connections: rankConnections(done.flatMap((x) => (start ? x.connections : x.connections.slice(0, 1)))), finished: done.length, total: combos.length });
+      return r;
+    })));
 
   // Normale Suche: je Variante nur die beste Verbindung im Zeitfenster nach der gewünschten Abfahrt.
   // Unterwegs bleiben alle Alternativen erhalten.
@@ -293,7 +301,7 @@ async function runCombination({ client, combo, stops, rules, now, startInfo, rea
   const stay = combo.via.length ? rules.viaMinimumStayMinutes : 0;
   const R = rules.minBufferMinutes;
   const variants = [...new Set([R, ...exceptionMinutes(combo)])].map((m) => ({ reserve: Math.max(0, m - stay) }));
-  if (realtimeNear) variants.push({ reserve: Math.max(0, R - stay), realtimeMode: 'REALTIME_ANNOTATION_ONLY' });
+  if (realtimeNear && startInfo) variants.push({ reserve: Math.max(0, R - stay), realtimeMode: 'REALTIME_ANNOTATION_ONLY' });
 
   const ask = (qs, vs) => Promise.allSettled(qs.flatMap((q) => vs.map(async (v) => {
     const res = await client.plan({
@@ -304,7 +312,7 @@ async function runCombination({ client, combo, stops, rules, now, startInfo, rea
       transitModes: rules.transitModes,
       numItineraries: rules.itinerariesPerQuery ?? rules.connectionsPerVariant,
     });
-    return { ...res, itineraries: (res.itineraries ?? []).map((it) => withoutTransferReserve(it, v.reserve)) };
+    return { ...res, itineraries: (res.itineraries ?? []).map((it) => trimOffsetWalks(withoutTransferReserve(it, v.reserve), q)) };
   })));
 
   // Nur Verbindungen behalten, die zur Variante passen (Bus-Umstieg am richtigen Bahnhof)
@@ -327,7 +335,10 @@ async function runCombination({ client, combo, stops, rules, now, startInfo, rea
     const settled = await ask(qs, variants);
     if (settled.every((s) => s.status === 'rejected')) return { error: settled[0].reason?.message ?? 'Abfrage fehlgeschlagen' };
     let found = collect(settled);
-    if (dropped.buffer.size) {
+    // Normale Suche: zweite Runde nur, wenn im Zeitfenster sonst nichts Brauchbares übrig bleibt
+    const windowEnd = qs[0].time + (rules.maxWaitMinutes ?? Infinity) * 60_000;
+    const enough = !startInfo && found.some((it) => Date.parse(it.legs.find((l) => l.mode !== 'WALK')?.startTime ?? it.startTime) <= windowEnd);
+    if (dropped.buffer.size && !enough) {
       // Zweite Runde: volle Reserve (Umstiege außerhalb der Via-Halte), unterwegs ab Ankunft + Mindestpuffer
       const later = qs.map((q) => (startInfo?.trip?.arrivalScheduled ? { ...q, time: q.time + R * 60_000 } : q));
       found = found.concat(collect(await ask(later, [{ reserve: R }])));
@@ -343,7 +354,7 @@ async function runCombination({ client, combo, stops, rules, now, startInfo, rea
   // Weg B: Liefert die API bis zur Arbeit nichts, bis Wiesloch-Walldorf suchen und Bus schätzen.
   if (itineraries.length === 0 && combo.fallback && stops[combo.fallback.to]?.id) {
     const fbTo = stops[combo.fallback.to].id;
-    const fbQueries = [...new Map(queries.map((q) => [q.fromPlace, { ...q, toPlace: fbTo }])).values()];
+    const fbQueries = [...new Map(queries.map((q) => [q.fromPlace, { ...q, toPlace: fbTo, toStops: undefined }])).values()];
     const fb = await run(fbQueries);
     itineraries = mergeItineraries(fb.found ?? [], rules.connectionsPerVariant, queries[0].time);
     estimate = combo.fallback;

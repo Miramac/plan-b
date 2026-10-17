@@ -49,6 +49,8 @@
  * @property {string[]} via       Stop-IDs
  * @property {number} time
  * @property {number} [maxPreTransitTime]
+ * @property {string[]} [fromStops]  mehrere gleichwertige Start-Haltestellen (POST mit Offsets)
+ * @property {string[]} [toStops]    mehrere gleichwertige Ziel-Haltestellen
  */
 
 /**
@@ -336,14 +338,28 @@ export function buildQueries(combo, stops, now, start) {
   const via = combo.via.map(idOf);
   const to = combo.to.map(idOf);
   const from = start ? [start.place] : combo.from.map(idOf);
+  // Mehrere gleichwertige Haltestellen (beide Arbeits-Halte) → eine Abfrage mit Offsets statt zwei
+  const group = (keys) => {
+    const s = keys.map((k) => stops[k]);
+    return keys.length > 1 && s.every((x) => x?.id && x.lat != null)
+      ? { place: `${s[0].lat},${s[0].lon}`, ids: s.flatMap((x) => x.platforms ?? [x.id]) } // alle Steige, sonst fehlt die Gegenrichtung
+      : null;
+  };
   if (via.length > 2) missing.push('(mehr als 2 Via-Halte – MOTIS erlaubt max. 2)');
   if (missing.length) return { queries: [], missing: [...new Set(missing)] };
 
   const time = (start?.time ?? now) + (combo.fixedBefore ? combo.fixedBefore.minutes * MIN : 0);
+  const toGroup = group(combo.to);
+  const fromGroup = start ? null : group(combo.from);
+  const froms = fromGroup ? [{ place: fromGroup.place, stops: fromGroup.ids }] : from.map((f) => ({ place: f }));
+  const tos = toGroup ? [{ place: toGroup.place, stops: toGroup.ids }] : to.map((t) => ({ place: t }));
   const queries = [];
-  for (const f of from) {
-    for (const t of to) {
-      queries.push({ fromPlace: f, toPlace: t, via, time, maxPreTransitTime: start?.maxPreTransitTime });
+  for (const f of froms) {
+    for (const t of tos) {
+      queries.push({
+        fromPlace: f.place, toPlace: t.place, fromStops: f.stops, toStops: t.stops,
+        via, time, maxPreTransitTime: start?.maxPreTransitTime,
+      });
     }
   }
   return { queries, missing: [] };
@@ -546,6 +562,30 @@ export function withoutTransferReserve(it, reserveMin) {
       return { ...l, duration: (l.duration ?? 0) - cut, endTime: shift(l.endTime, cut), scheduledEndTime: shift(l.scheduledEndTime, cut) };
     }),
   };
+}
+
+/**
+ * Abfrage mit mehreren Ziel-/Start-Haltestellen (Offsets): MOTIS hängt dann noch einen Fußweg zum
+ * Hilfs-Koordinatenpunkt an. Ich bin aber schon an MEINER Haltestelle → diesen Fußweg entfernen.
+ * @param {any} it
+ * @param {{fromStops?: string[], toStops?: string[]}} q
+ */
+export function trimOffsetWalks(it, q) {
+  let legs = it.legs ?? [];
+  let { startTime, endTime } = it;
+  const last = legs[legs.length - 1];
+  const beforeLast = legs[legs.length - 2];
+  if (q.toStops?.length && last && !isTransitMode(last.mode) && beforeLast && q.toStops.includes(beforeLast.to?.stopId)) {
+    legs = legs.slice(0, -1);
+    endTime = beforeLast.endTime;
+  }
+  const first = legs[0];
+  const second = legs[1];
+  if (q.fromStops?.length && first && !isTransitMode(first.mode) && second && q.fromStops.includes(second.from?.stopId)) {
+    legs = legs.slice(1);
+    startTime = second.startTime;
+  }
+  return legs === it.legs ? it : { ...it, legs, startTime, endTime };
 }
 
 /**

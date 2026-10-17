@@ -4,13 +4,13 @@ import assert from 'node:assert/strict';
 
 import { STOPS, OUTBOUND, RETURN, RULES, WEATHER } from '../config.js';
 import {
-  normalize, pickStopMatch, buildCombinations, combinationsEnRoute, analyzeTransfers,
+  normalize, pickStopMatch, buildCombinations, buildQueries, combinationsEnRoute, analyzeTransfers,
   weatherAt, rankConnections, fitsVariant, forDeparture, meetsMinBuffer, nextOccurrence, withoutTransferReserve,
   mergeItineraries, meetsStartBuffer, zonedTime, requiredBuffer,
   recentDepartures, nearestStopKey, upcomingStops, groupByExit, analyzeItinerary, nextStopOfTrip as nextStop, combinationsEnRoute as enRoute, nextStep, recommendationChanged, recommendationKey, nextStopOfTrip,
 } from '../logic.js';
 import { resolveStops, planJourney, locateInTrip } from '../planner.js';
-import { placeMatchesStop, stationCode, touchesAvoidedStation } from '../logic.js';
+import { placeMatchesStop, stationCode, touchesAvoidedStation, trimOffsetWalks } from '../logic.js';
 import { createFakeClient, MATCHES } from './fake-transitous.js';
 
 const MIN = 60_000;
@@ -320,10 +320,14 @@ test('planJourney: Reserve = Mindestpuffer − Via-Aufenthalt, Bruchsal-Ausnahme
   assert.ok(plans.every((p) => !p.realtimeMode));
 });
 
-test('planJourney: nahe "jetzt" zusätzlich Routing nach Fahrplan mit Echtzeit-Info', async () => {
+test('planJourney: unterwegs zusätzlich Routing nach Fahrplan mit Echtzeit-Info, normal nicht', async () => {
+  const normal = createFakeClient();
+  const st = await resolveStops(normal.client, GEO_STOPS);
+  await planJourney({ client: normal.client, journey: OUTBOUND, stops: st, rules: RULES, now: NOW, realNow: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  assert.ok(normal.calls.filter((c) => c.type === 'plan').every((p) => !p.realtimeMode));
   const { client, calls } = createFakeClient();
   const stops = await resolveStops(client, GEO_STOPS);
-  await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, realNow: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, realNow: NOW, start: { type: 'gps', lat: 49.25, lon: 8.52 }, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
   const plans = calls.filter((c) => c.type === 'plan');
   const ann = plans.filter((p) => p.realtimeMode === 'REALTIME_ANNOTATION_ONLY');
   assert.equal(ann.length, plans.length / 2);
@@ -574,4 +578,24 @@ test('planJourney: nur Nahverkehr wird angefragt (kein ICE/IC)', async () => {
   await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
   const plans = calls.filter((c) => c.type === 'plan');
   assert.ok(plans.every((p) => !p.transitModes.includes('HIGHSPEED_RAIL') && !p.transitModes.includes('LONG_DISTANCE')));
+});
+
+test('buildQueries: beide Arbeits-Haltestellen in einer Abfrage (Offsets)', async () => {
+  const { client } = createFakeClient();
+  const stops = await resolveStops(client, GEO_STOPS);
+  const out = buildQueries(buildCombinations(OUTBOUND).find((c) => c.id === 'bus+A1'), stops, NOW).queries;
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0].toStops, [stops.workIndustrie.id, stops.workHdm.id]);
+  const back = buildQueries(buildCombinations(RETURN).find((c) => c.id === 'A1+bus'), stops, NOW).queries;
+  assert.equal(back.length, 1);
+  assert.equal(back[0].fromStops.length, 2);
+});
+
+test('trimOffsetWalks: künstlichen Fußweg zum Hilfspunkt entfernen', () => {
+  const H = { n: 'Walldorf,HDM', id: 'hdm:RiW' };
+  const it = { startTime: iso(0), endTime: iso(30), legs: [tleg('BUS', WW, H, 0, 22), tleg('WALK', H, { n: 'Koordinate', id: undefined }, 22, 30)] };
+  const t = trimOffsetWalks(it, { toStops: ['ind:1', 'hdm:RiW'] });
+  assert.equal(t.legs.length, 1);
+  assert.equal(t.endTime, iso(22));
+  assert.equal(trimOffsetWalks(it, {}).legs.length, 2); // ohne Offsets unverändert
 });

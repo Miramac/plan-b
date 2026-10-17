@@ -12,6 +12,7 @@
  *                              Nach der ersten Abfrage zeigt die App die gefundenen IDs zum Kopieren an.
  * @property {number} [lat]     Koordinaten (optional, für den GPS-Unterwegs-Modus hilfreich)
  * @property {number} [lon]
+ * @property {string[]} [platforms]  alle Steige einer Bushaltestelle (für Abfragen mit mehreren Zielen)
  */
 
 /** @type {Record<string, StopConfig>} */
@@ -26,9 +27,11 @@ export const STOPS = {
   neulussheim:      { name: 'Neulußheim', place: 'Neulußheim', rail: true, id: 'de-DELFI_de:08226:3101', lat: 49.29295, lon: 8.53067 },
   hockenheim:       { name: 'Hockenheim', place: 'Hockenheim', rail: true, id: 'de-DELFI_de:08226:1620', lat: 49.31741, lon: 8.53738 },
   oftersheim:       { name: 'Oftersheim', place: 'Oftersheim', rail: true, id: 'de-DELFI_de:08226:3285', lat: 49.37335, lon: 8.57899 },
-  // Bushalte: ID eines Steigs, die API berücksichtigt beide Fahrtrichtungen
-  workIndustrie:    { name: 'Industriestraße', place: 'Walldorf', id: 'de-DELFI_de:08226:4277:0:1', lat: 49.29276, lon: 8.64824 },
-  workHdm:          { name: 'HDM Philipp-Reis-Straße', place: 'Walldorf', id: 'de-DELFI_de:08226:4023:0:RiO', lat: 49.2898, lon: 8.65166 },
+  // Bushalte: ID eines Steigs; platforms = alle Steige (beide Fahrtrichtungen) für die gemeinsame Abfrage
+  workIndustrie:    { name: 'Industriestraße', place: 'Walldorf', id: 'de-DELFI_de:08226:4277:0:1', lat: 49.29276, lon: 8.64824,
+    platforms: ['de-DELFI_de:08226:4277:0:1', 'de-DELFI_de:08226:4277:0:2'] },
+  workHdm:          { name: 'HDM Philipp-Reis-Straße', place: 'Walldorf', id: 'de-DELFI_de:08226:4023:0:RiO', lat: 49.2898, lon: 8.65166,
+    platforms: ['de-DELFI_de:08226:4023:0:RiO', 'de-DELFI_de:08226:4023:0:RiW'] },
 };
 
 /** Beide Arbeits-Haltestellen sind gleichwertig – es wird zu/ab beiden gesucht. */
@@ -132,7 +135,7 @@ export const RULES = {
   maxWaitMinutes: 30,
   perVariant: 1,
   itinerariesPerQuery: 5, // so viele je Abfrage holen – einige fallen durch die Umstiegsregeln weg
-  maxParallelRequests: 4, // schont die Transitous-API
+  maxParallelRequests: 6, // gleichzeitige Abfragen (Transitous antwortet je Abfrage in ~2–4 s)
   autoRefreshMinutes: 3, // Unterwegs-Modus
   maxPreTransitSecondsFromGps: 1800, // max. Fußweg vom GPS-Standort zur ersten Haltestelle
 };
