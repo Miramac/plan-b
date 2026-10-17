@@ -233,3 +233,5 @@ details.more .inline { margin-top: 8px; }
 .opt .arr { font-weight: 700; font-variant-numeric: tabular-nums; }
 .opt .via { color: var(--muted); }
 .results-title { font-size: 1.05rem; margin: 6px 2px 8px; }
+
+.spinner.small { width: 12px; height: 12px; border-width: 2px; margin: 0 2px 0 0; }

@@ -32,6 +32,7 @@ Für GPS (Unterwegs-Modus) muss die Seite über HTTPS (oder localhost) laufen.
 - **Zur Arbeit / Nach Hause:** fragt alle Varianten der Richtung ab.
 - **Abfahrt:** *Jetzt* (mit Echtzeit), *Gewohnt* (nächster Werktag 7:30 bzw. 17:00, in `config.js` → `usualTime`) oder eigene *Uhrzeit*.
   Pro Variante erscheint nur die beste Verbindung, die höchstens 30 Min. nach der gewünschten Abfahrt startet (`RULES.maxWaitMinutes`, `RULES.perVariant`); später fahrende Varianten stehen grau darunter („erst ab 8:11“). Unterwegs zeigt die App dagegen alle Alternativen.
+- **Zwischenspeicher:** Das letzte Ergebnis je Richtung liegt im Browser. Beim Öffnen der Seite erscheint sofort die zuletzt genutzte Richtung („gespeicherter Stand …“) und wird im Hintergrund aktualisiert; ebenso beim Tippen auf „Zur Arbeit“/„Nach Hause“.
 - **Unterwegs → „Ich sitze in …“:** Bahnhof wählen (oder 📍 nächster Bahnhof per GPS), dann deinen Zug aus den Abfahrten der letzten Stunde antippen. Die App fragt die Fahrt live ab (Verspätung, entfallende Halte, vorzeitiges Ende) und zeigt **„Wo aussteigen?“**: je möglichem Ausstieg die beste Weiterfahrt mit Ankunft und Umstiegspuffer. Kommt der Zug erst noch, gibt es zusätzlich „Nicht einsteigen – stattdessen …“.
 - **Neu prüfen / Auto alle 3 Min.:** aktualisiert mit frischen Verspätungen; ändert sich die Empfehlung, erscheint „🔀 Neue Empfehlung“. Nach dem empfohlenen Ausstieg stoppt das Auto-Update und fragt nach dem neuen Zug.
 - **Ab Standort:** alternativ ab GPS-Position planen (im Zug oft ungenau).

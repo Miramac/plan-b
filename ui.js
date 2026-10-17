@@ -109,9 +109,13 @@ async function run(journeyKey, start, opts = {}) {
   const journey = JOURNEYS[journeyKey];
   setBusy(true);
   clearMessages();
-  $('#results').innerHTML = `<li class="loading"><span class="spinner"></span>Frage Verbindungen ab …</li>`;
   if (!start || start.type !== 'trip') $('#trip').innerHTML = '';
-  $('#summary').textContent = '';
+  // Normale Suche: letztes Ergebnis sofort zeigen, frische Daten kommen im Hintergrund
+  const showedCache = !start && showCached(journeyKey);
+  if (!showedCache) {
+    $('#results').innerHTML = `<li class="loading"><span class="spinner"></span>Frage Verbindungen ab …</li>`;
+    $('#summary').textContent = '';
+  }
 
   renderTimeHint();
   try {
@@ -143,6 +147,10 @@ async function run(journeyKey, start, opts = {}) {
       // Teilergebnisse sofort zeigen, statt auf die langsamste Abfrage zu warten
       onProgress: ({ connections: partial, finished, total }) => {
         if (opts.session !== undefined && opts.session !== state.enRoute.session) return;
+        if (showedCache) { // gespeicherte Liste stehen lassen, nur Fortschritt zeigen
+          $('#summary').innerHTML = `${esc(cachedSummary(journeyKey))} · <span class="spinner small"></span> aktualisiere (${finished}/${total}) …`;
+          return;
+        }
         if (partial.length) renderResults(partial, [], !!start, realNow);
         else $('#results').innerHTML = '';
         $('#results').insertAdjacentHTML('beforeend', `<li class="loading"><span class="spinner"></span>${finished} von ${total} Varianten geladen …</li>`);
@@ -180,15 +188,37 @@ async function run(journeyKey, start, opts = {}) {
     else $('#trip').innerHTML = '';
     const from = start ? ` · ab ${start.type === 'gps' ? 'Standort' : start.label}` : ` · ab ${fmtWhen(now, realNow)}`;
     $('#summary').textContent = `${journey.label}${from} · Stand ${fmtTime(realNow)} · ${connections.length} Verbindungen aus ${results.length} Varianten`;
+    if (!start) {
+      store.set(`result:${journeyKey}`, { at: realNow, now, connections, results });
+      store.set('lastJourney', journeyKey);
+    }
     fillTripSelect();
   } catch (e) {
-    $('#results').innerHTML = '';
+    if (!showedCache) $('#results').innerHTML = '';
+    else $('#summary').textContent = `${cachedSummary(journeyKey)} · Aktualisierung fehlgeschlagen`;
     message('error', `❌ ${esc(e.message || String(e))}`);
   } finally {
     state.busy = false;
     state.enRoute.lastRun = Date.now();
     setBusy(false);
   }
+}
+
+/** Letztes Ergebnis einer Richtung aus dem Browser-Speicher anzeigen. @returns {boolean} gezeigt? */
+function showCached(journeyKey) {
+  const c = store.get(`result:${journeyKey}`);
+  if (!c?.connections) return false;
+  const realNow = Date.now();
+  renderResults(c.connections, c.results ?? [], false, realNow);
+  renderWeather(store.get('weather')?.data ?? null, c.now, realNow);
+  $('#summary').innerHTML = `${esc(cachedSummary(journeyKey))} · <span class="spinner small"></span> aktualisiere …`;
+  return true;
+}
+
+function cachedSummary(journeyKey) {
+  const c = store.get(`result:${journeyKey}`);
+  const realNow = Date.now();
+  return c ? `${JOURNEYS[journeyKey].label} · ab ${fmtWhen(c.now, realNow)} · gespeicherter Stand ${fmtWhen(c.at, realNow)}` : JOURNEYS[journeyKey].label;
 }
 
 /** Wetter höchstens alle 15 Min. neu laden (Open-Meteo ist manchmal überlastet). */
@@ -759,3 +789,7 @@ $('#time-custom').addEventListener('change', (e) => {
 renderTimeHint();
 setInterval(() => { if (document.visibilityState === 'visible') renderTimeHint(); }, 60_000);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') renderTimeHint(); });
+
+// Beim Öffnen: letzte Richtung sofort aus dem Speicher zeigen und im Hintergrund aktualisieren
+const lastJourney = store.get('lastJourney');
+if (lastJourney && JOURNEYS[lastJourney]) run(lastJourney);
