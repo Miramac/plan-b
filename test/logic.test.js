@@ -6,9 +6,11 @@ import { STOPS, OUTBOUND, RETURN, RULES, WEATHER } from '../config.js';
 import {
   normalize, pickStopMatch, buildCombinations, combinationsEnRoute, analyzeTransfers,
   weatherAt, rankConnections, fitsVariant, meetsMinBuffer, nextOccurrence, withoutTransferReserve,
-  mergeItineraries, meetsStartBuffer, zonedTime, requiredBuffer, recommendationChanged, recommendationKey, nextStopOfTrip,
+  mergeItineraries, meetsStartBuffer, zonedTime, requiredBuffer,
+  recentDepartures, nearestStopKey, upcomingStops, groupByExit, analyzeItinerary, nextStopOfTrip as nextStop, combinationsEnRoute as enRoute, nextStep, recommendationChanged, recommendationKey, nextStopOfTrip,
 } from '../logic.js';
-import { resolveStops, planJourney } from '../planner.js';
+import { resolveStops, planJourney, locateInTrip } from '../planner.js';
+import { placeMatchesStop, stationCode } from '../logic.js';
 import { createFakeClient, MATCHES } from './fake-transitous.js';
 
 const MIN = 60_000;
@@ -373,4 +375,152 @@ test('requiredBuffer: Bruchsal-Ausnahme nur Richtung Graben-Neudorf', () => {
   const toKA = { fromName: 'Bruchsal', fromStopId: 'de-DELFI_de:08215:1856:3:3', toName: 'Karlsruhe Hbf', toStopId: 'ka' };
   assert.equal(requiredBuffer(arr, toGN, combo, realStops, RULES), 2);
   assert.equal(requiredBuffer(arr, toKA, combo, realStops, RULES), RULES.minBufferMinutes);
+});
+
+// --- Unterwegs: Zugauswahl und "Wo aussteigen?"
+test('recentDepartures: letzte Stunde bis +20 Min., Verspätung, ohne Endhalte und Doppelte', () => {
+  const st = (min, delay, tripId, extra = {}) => ({
+    tripId, displayName: 'S9', routeShortName: 'S9', headsign: 'Mannheim', mode: 'SUBURBAN', realTime: true,
+    place: { scheduledDeparture: iso(min), departure: iso(min + delay) }, ...extra,
+  });
+  const deps = recentDepartures([
+    st(-90, 0, 'alt'), st(-20, 3, 'a'), st(-20, 3, 'a'), st(5, 0, 'b'), st(40, 0, 'spät'),
+    { ...st(-5, 0, 'ende'), place: { scheduledArrival: iso(-5), arrival: iso(-5) } },
+  ], NOW);
+  assert.deepEqual(deps.map((d) => d.tripId), ['a', 'b']);
+  assert.equal(deps[0].delayMin, 3);
+});
+
+test('nearestStopKey: nächster Bahnhof zur Position', () => {
+  assert.equal(nearestStopKey(STOPS, { lat: 49.318, lon: 8.536 }), 'hockenheim');
+  assert.equal(nearestStopKey(STOPS, { lat: 49.163, lon: 8.49 }), 'grabenNeudorf');
+});
+
+test('upcomingStops: nur Halte nach jetzt, mit Verspätung', () => {
+  const trip = { legs: [{ mode: 'SUBURBAN',
+    from: { name: 'GN', stopId: 'gn', scheduledDeparture: iso(-10), departure: iso(-8) },
+    intermediateStops: [{ name: 'Neul', stopId: 'n', scheduledArrival: iso(2), arrival: iso(5) }],
+    to: { name: 'Hock', stopId: 'h', scheduledArrival: iso(6), arrival: iso(8) } }] };
+  const up = upcomingStops(trip, NOW);
+  assert.deepEqual(up.map((p) => [p.name, p.delayMin]), [['Neul', 3], ['Hock', 2]]);
+});
+
+test('groupByExit: Alternativen nach Ausstiegs-Halt, entlang der Fahrt sortiert', () => {
+  const combo = buildCombinations(OUTBOUND).find((c) => c.id === 'bike+A1');
+  const HOCK = { n: 'Hockenheim, Bahnhof', id: 'h' };
+  const mine = (to, arr) => ({ ...tleg('SUBURBAN', GN, to, 0, arr), tripId: 'S9-mine' });
+  const it = (to, arr, busDep) => ({ startTime: iso(0), endTime: iso(busDep + 20), legs: [mine(to, arr), tleg('BUS', to, WORKSTOP, busDep, busDep + 20)] });
+  const conns = rankConnections([
+    analyzeItinerary(it(HOCK, 14, 20), combo, {}, RULES), // Hockenheim, an +40
+    analyzeItinerary(it(NEUL, 11, 16), combo, {}, RULES), // Neulußheim, an +36 → beste
+    analyzeItinerary({ startTime: iso(2), endTime: iso(30), legs: [tleg('BUS', GN, WORKSTOP, 3, 30)] }, combo, {}, RULES), // am nächsten Halt raus
+  ]);
+  const start = { tripId: 'S9-mine', place: { name: 'Wiesental Bahnhof' }, time: NOW + 1 * MIN, delayMin: 1 };
+  const groups = groupByExit(conns, start, RULES.tightTransferMinutes);
+  assert.deepEqual(groups.map((g) => g.exitName), ['Wiesental Bahnhof', 'Neulußheim, Bahnhof', 'Hockenheim, Bahnhof']);
+  assert.equal(groups[1].best, false); // beste = am nächsten Halt raus (an +30)
+  assert.equal(groups[0].best, true);
+  assert.equal(groups[1].options[0].transfer.bufferMin, 5);
+  assert.equal(groups[1].options[0].onward[0].mode, 'BUS');
+  assert.equal(groups[0].options[0].transfer.bufferMin, 2); // 3 − 1
+});
+
+// --- Review-Funde Unterwegs-Modus
+const place = (name, arr, dep, extra = {}) => ({ name, stopId: name, arrival: arr == null ? undefined : iso(arr), departure: dep == null ? undefined : iso(dep),
+  scheduledArrival: arr == null ? undefined : iso(arr), scheduledDeparture: dep == null ? undefined : iso(dep), ...extra });
+const tripOf = (stopsList) => ({ legs: [{ mode: 'SUBURBAN', displayName: 'S33', headsign: 'Germersheim', realTime: true,
+  from: stopsList[0], intermediateStops: stopsList.slice(1, -1), to: stopsList[stopsList.length - 1] }] });
+
+test('nextStopOfTrip: entfallender Halt wird übersprungen, haltender Zug, vorzeitiges Ende', () => {
+  const skip = tripOf([place('A', null, -10), place('B', 2, 3, { cancelled: true }), place('C', 6, 7), place('D', 12, null)]);
+  assert.equal(nextStop(skip, NOW).next.name, 'C');
+  const held = tripOf([place('A', null, -10), place('B', -2, 4), place('C', 8, 9)]);
+  assert.equal(nextStop(held, NOW).next.name, 'B'); // steht noch in B
+  const early = tripOf([place('A', null, -10), place('K', 3, 4), place('G', 8, 9, { cancelled: true }), place('Z', 12, null, { cancelled: true })]);
+  const r = nextStop(early, NOW);
+  assert.equal(r.next.name, 'K');
+  assert.equal(r.endsEarly, true);
+  assert.equal(r.terminus.name, 'K');
+});
+
+test('locateInTrip: Zug noch nicht am Einstiegsbahnhof → Start dort; vorzeitiges Ende → ab dort', async () => {
+  const trip = tripOf([place('Bruchsal', null, -5), place('Graben-Neudorf Bahnhof', 4, 6), place('Huttenheim', 12, 13), place('Germersheim', 20, null)]);
+  const client = { trip: async () => trip };
+  const board = { key: 'grabenNeudorf', id: 'Graben-Neudorf Bahnhof', expected: 'Graben-Neudorf', name: 'Graben-Neudorf Bahnhof' };
+  const s1 = await locateInTrip(client, 't1', NOW, { board });
+  assert.equal(s1.notBoarded, true);
+  assert.equal(s1.place.name, 'Graben-Neudorf Bahnhof');
+  assert.equal(s1.time, NOW + 6 * MIN);
+  assert.equal(s1.boardKey, 'grabenNeudorf');
+  assert.deepEqual(s1.passed, []); // Bruchsal davor zählt nicht
+  const s2 = await locateInTrip(client, 't1', NOW + 8 * MIN, { board });
+  assert.equal(s2.place.name, 'Huttenheim');
+  assert.deepEqual(s2.passed.map((p) => p.name), ['Graben-Neudorf Bahnhof']); // nur ab Einstieg
+  const ended = tripOf([place('A', null, -20), place('K', -3, null), place('G', 5, 6, { cancelled: true }), place('Z', 12, null, { cancelled: true })]);
+  const s3 = await locateInTrip({ trip: async () => ended }, 't2', NOW);
+  assert.equal(s3.place.name, 'K');
+  assert.equal(s3.tripId, null);
+  assert.equal(s3.endsEarly, true);
+});
+
+test('combinationsEnRoute: Via vor einem passierten Via-Halt fällt mit weg', () => {
+  const combos = enRoute(buildCombinations(OUTBOUND), (k) => k === 'bruchsal');
+  const b = combos.find((c) => c.stage2 === 'B');
+  assert.deepEqual(b.via, []); // Graben-Neudorf liegt vor Bruchsal
+  const a1 = combos.find((c) => c.via.includes('neulussheim'));
+  assert.deepEqual(a1.busTransferAt, ['neulussheim']);
+});
+
+test('mergeItineraries: fällt die schnellste aus, bleibt die nächste Alternative', () => {
+  const S = { n: 'Bruchsal', id: 'b' };
+  const mine = { ...tleg('SUBURBAN', GN, S, 0, 13), tripId: 'S33' };
+  const onward = (dep, cancelled) => ({ startTime: iso(0), endTime: iso(dep + 15), legs: [mine, { ...tleg('SUBURBAN', S, WW, dep, dep + 15), tripId: `S3-${dep}`, cancelled }] });
+  const merged = mergeItineraries([onward(17, true), onward(47, false)], 3);
+  assert.equal(merged.length, 2);
+});
+
+test('groupByExit: umsteigefreie Weiterfahrt gehört zur aktuellen Fahrt', () => {
+  const combo = buildCombinations(OUTBOUND).find((c) => c.id === 'bike+A2');
+  const H = { n: 'Hockenheim, Bahnhof', id: 'h' };
+  const it = { startTime: iso(0), endTime: iso(30), legs: [
+    { ...tleg('SUBURBAN', GN, NEUL, 0, 5), tripId: 'T1' },
+    { ...tleg('SUBURBAN', NEUL, H, 5, 9), tripId: 'T2', interlineWithPreviousLeg: true },
+    tleg('BUS', H, WORKSTOP, 14, 30),
+  ] };
+  const conns = rankConnections([analyzeItinerary(it, combo, {}, RULES)]);
+  const [g] = groupByExit(conns, { tripId: 'T1', place: { name: 'x' }, time: NOW }, RULES.tightTransferMinutes);
+  assert.equal(g.exitName, 'Hockenheim, Bahnhof');
+  assert.equal(g.options[0].onward.length, 1);
+});
+
+test('nextStep: sitze ich schon in der ersten Fahrt → "aussteigen in …"', () => {
+  const combo = buildCombinations(OUTBOUND).find((c) => c.id === 'bike+B');
+  const it = { startTime: iso(5), endTime: iso(40), legs: [{ ...tleg('SUBURBAN', GN, BR, 5, 18), tripId: 'S33' }, tleg('SUBURBAN', BR, WW, 25, 40)] };
+  const c = analyzeItinerary(it, combo, {}, RULES);
+  const step = nextStep(c, NOW, 'S33'); // S33 fährt laut Plan erst in 5 Min. weiter, ich sitze aber drin
+  assert.equal(step.type, 'change');
+  assert.equal(step.stop, 'Bruchsal');
+});
+
+test('placeMatchesStop: Stationsnummer entscheidet ("Graben-Neudorf Nord" ≠ "Graben-Neudorf")', () => {
+  const gn = { key: 'grabenNeudorf', id: 'de-DELFI_de:08215:32585', expected: 'Graben-Neudorf', name: 'Graben-Neudorf' };
+  assert.equal(stationCode('de-KVV_Pde:08215:7702'), 'de:08215:7702');
+  assert.equal(placeMatchesStop({ name: 'Graben-Neudorf Nord', stopId: 'de-DELFI_de:08215:32591' }, gn), false);
+  assert.equal(placeMatchesStop({ name: 'Graben-Neudorf Bahnhof', stopId: 'de-DELFI_de:08215:32585:4:4' }, gn), true);
+  assert.equal(placeMatchesStop({ name: 'Graben Bahnhof', stopId: 'de-KVV_Pde:08215:32585' }, gn), true); // Bus am Bahnhof, anderer Datensatz
+  assert.equal(placeMatchesStop({ name: 'Graben-Neudorf Bahnhof' }, gn), true); // ohne ID: Name
+});
+
+test('locateInTrip: Zug endete vor meinem Einstiegsbahnhof → klare Fehlermeldung', async () => {
+  const trip = tripOf([place('A', null, -20), place('K', -12, -11), place('Graben-Neudorf Bahnhof', -5, -4, { cancelled: true }), place('E', 5, null, { cancelled: true })]);
+  const board = { key: 'grabenNeudorf', id: 'Graben-Neudorf Bahnhof', expected: 'Graben-Neudorf', name: 'Graben-Neudorf Bahnhof' };
+  await assert.rejects(locateInTrip({ trip: async () => trip }, 't', NOW, { board, boardStopId: 'Graben-Neudorf Bahnhof' }), /nicht erreicht/);
+});
+
+test('locateInTrip: vor dem Einsteigen schon "endet vorzeitig" melden', async () => {
+  const trip = tripOf([place('A', null, -20), place('Graben-Neudorf Bahnhof', 5, 6), place('K', 10, 11), place('E', 20, null, { cancelled: true })]);
+  const s = await locateInTrip({ trip: async () => trip }, 't', NOW, { boardStopId: 'Graben-Neudorf Bahnhof' });
+  assert.equal(s.notBoarded, true);
+  assert.equal(s.endsEarly, true);
+  assert.equal(s.terminus, 'K');
 });

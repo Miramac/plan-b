@@ -5,7 +5,7 @@ import {
   pickStopMatch, buildCombinations, combinationsEnRoute, buildQueries, mergeItineraries,
   analyzeItinerary, fitsVariant, meetsMinBuffer, meetsStartBuffer, exceptionMinutes, withoutTransferReserve,
   itineraryKey, rankConnections, weatherAt, isViaBehind, placeMatchesStop,
-  nextStopOfTrip, currentTransitLeg, tokens,
+  nextStopOfTrip, currentTransitLeg, tokens, recentDepartures, upcomingStops, tripSequence,
 } from './logic.js';
 
 /**
@@ -21,7 +21,10 @@ import {
  *
  * @typedef {{type: 'gps', lat: number, lon: number}
  *         | {type: 'trip', place: {stopId: string, name: string}, time: number, passed: Array<{name: string, stopId?: string}>, label: string,
- *            tripId?: string, arrivalScheduled?: number}} EnRouteStart
+ *            tripId?: string|null, arrivalScheduled?: number, delayMin?: number, realTime?: boolean, upcoming?: Array<any>,
+ *            boardKey?: string, notBoarded?: boolean, boardCancelled?: boolean, endsEarly?: boolean, terminus?: string}} EnRouteStart
+ *   boardKey: Config-Haltestelle, an der ich eingestiegen bin (alles davor liegt hinter mir)
+ *   notBoarded: Zug ist am Einstiegsbahnhof noch nicht abgefahren → Planung ab dort
  *   tripId/arrivalScheduled: Fahrt, in der ich sitze, und ihre planmäßige Ankunft am Start-Halt (Umstiegsprüfung)
  *
  * @typedef {Object} ComboResult
@@ -78,10 +81,111 @@ export function choiceSignature(cfg) {
   return `${cfg.name}|${cfg.place}|${cfg.query ?? ''}`;
 }
 
+/** Endgültiger Fehler unterwegs (Fahrt vorbei, Verbindung beendet) – im Gegensatz zu Netzwerkfehlern. */
+export class FinalTripError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'FinalTripError';
+  }
+}
+
 /**
- * "Ich sitze gerade in …": aktuelle Fahrt der gewählten Verbindung live abfragen
- * und den nächsten Halt (inkl. Echtzeit-Verspätung) als neuen Startpunkt liefern.
+ * Zugauswahl unterwegs: Abfahrten der letzten Stunde (und der nächsten Minuten) an einer Haltestelle.
+ * @param {TransitousClient} client
+ * @param {string} stopId
+ * @param {number} now
+ * @returns {Promise<import('./logic.js').Departure[]>}
+ */
+export async function departuresAt(client, stopId, now) {
+  const res = await client.stoptimes({ stopId, time: now - 60 * 60_000, n: 60 });
+  return recentDepartures(res.stopTimes, now, { pastMinutes: 60, futureMinutes: 20 });
+}
+
+/**
+ * "Ich sitze in diesem Zug": Fahrt live abfragen und den nächsten bedienten Halt (inkl. Echtzeit)
+ * als neuen Startpunkt liefern.
+ * - Ist der Zug am Einstiegsbahnhof noch nicht abgefahren → Start dort (ich steige erst ein).
+ * - Entfallende Halte werden übersprungen; endet der Zug vorzeitig, ist der letzte bediente Halt das Ende.
+ * - Als passiert zählen nur Halte ab dem Einstiegsbahnhof (bei Ringfahrten nicht die Runde davor).
  *
+ * @param {TransitousClient} client
+ * @param {string} tripId
+ * @param {number} now
+ * @param {{alsoPassed?: Array<{name: string, stopId?: string}>, board?: ResolvedStop, boardStopId?: string, label?: string}} [opts]
+ *   board = Einstiegsbahnhof, boardStopId = genauer Bahnsteig aus der Abfahrtsliste,
+ *   label = Zugname wie in der Abfahrtsliste (die Fahrt selbst heißt bei durchgebundenen Zügen evtl. anders)
+ * @returns {Promise<EnRouteStart>}
+ */
+export async function locateInTrip(client, tripId, now, { alsoPassed = [], board, boardStopId, label: shownLabel } = {}) {
+  const trip = await client.trip(tripId);
+  const leg = trip?.legs?.[0];
+  const seq = tripSequence(trip);
+  const line = leg?.displayName || leg?.routeShortName || '';
+  const label = shownLabel ?? `${line}${leg?.headsign ? ` → ${leg.headsign}` : ''}`;
+  const realTime = !!leg?.realTime;
+  const t = (iso) => Date.parse(iso);
+  const minutes = (a, b) => Math.round((a - b) / 60_000);
+  // Einstieg: zuerst exakt über den Bahnsteig, sonst über die Station
+  let boardIdx = boardStopId ? seq.findIndex((p) => p.stopId === boardStopId) : -1;
+  if (boardIdx < 0 && board) boardIdx = seq.findIndex((p) => !p.cancelled && placeMatchesStop(p, board));
+
+  // Noch nicht am Einstiegsbahnhof abgefahren → ich steige dort erst ein
+  if (boardIdx >= 0) {
+    const b = seq[boardIdx];
+    const dep = t(b.departure ?? b.arrival);
+    if (dep > now) {
+      const sched = t(b.scheduledDeparture ?? b.departure ?? b.arrival);
+      const { terminus, endsEarly } = nextStopOfTrip(trip, now);
+      return {
+        type: 'trip', place: { stopId: b.stopId, name: b.name }, time: dep, passed: alsoPassed,
+        label: `${label} ab ${b.name}${b.cancelled ? ' (hält hier nicht!)' : ''}`, tripId, notBoarded: true, boardKey: board?.key,
+        boardCancelled: !!b.cancelled, endsEarly, terminus: terminus?.name,
+        delayMin: minutes(dep, sched), realTime, upcoming: upcomingStops(trip, now).filter((p) => seq.findIndex((x) => x.stopId === p.stopId) > boardIdx),
+      };
+    }
+  }
+
+  const { next, passed, terminus, endsEarly } = nextStopOfTrip(trip, now);
+  const fromBoard = (list) => (boardIdx >= 0 ? list.filter((p) => seq.indexOf(p) >= boardIdx) : list);
+  const toPassed = (list) => [...alsoPassed, ...fromBoard(list).map((p) => ({ name: p.name, stopId: p.stopId }))];
+
+  if (!next) {
+    // Zug ist am (evtl. vorzeitigen) Ende angekommen: kurz danach ab dort planen, ohne Weiterfahrt
+    const arr = terminus ? t(terminus.arrival ?? terminus.departure) : 0;
+    if (!terminus || arr < now - 30 * 60_000) throw new FinalTripError('Diese Fahrt ist schon am Ziel – bitte eine andere wählen.');
+    // Zug endete schon VOR dem Einstiegsbahnhof → er war nie dort, wo ich bin
+    if (boardIdx >= 0 && seq.indexOf(terminus) < boardIdx) {
+      throw new FinalTripError(`Dieser Zug hat ${seq[boardIdx].name} nicht erreicht (endete in ${terminus.name}).`);
+    }
+    return {
+      type: 'trip', place: { stopId: terminus.stopId, name: terminus.name }, time: now,
+      passed: toPassed(passed.filter((p) => p !== terminus)), label: `${label} (endet in ${terminus.name})`,
+      tripId: null, arrivalScheduled: t(terminus.scheduledArrival ?? terminus.arrival), delayMin: minutes(arr, t(terminus.scheduledArrival ?? terminus.arrival)),
+      realTime, upcoming: [], boardKey: board?.key, endsEarly, terminus: terminus.name,
+    };
+  }
+
+  const time = t(next.arrival ?? next.departure);
+  const scheduled = t(next.scheduledArrival ?? next.scheduledDeparture ?? next.arrival ?? next.departure);
+  return {
+    type: 'trip',
+    place: { stopId: next.stopId, name: next.name },
+    time: Math.max(now, time),
+    passed: toPassed(passed),
+    label,
+    tripId,
+    arrivalScheduled: scheduled,
+    delayMin: minutes(time, scheduled),
+    realTime,
+    upcoming: upcomingStops(trip, now),
+    boardKey: board?.key,
+    endsEarly,
+    terminus: terminus?.name,
+  };
+}
+
+/**
+ * "Ich sitze gerade in …" aus der letzten Abfrage: die Fahrt, in der ich laut Verbindung gerade sitze.
  * @param {TransitousClient} client
  * @param {Connection} conn
  * @param {number} now
@@ -89,7 +193,7 @@ export function choiceSignature(cfg) {
  */
 export async function locateInConnection(client, conn, now) {
   const leg = currentTransitLeg(conn, now);
-  if (!leg) throw new Error('Diese Verbindung ist schon beendet – bitte eine aktuellere wählen oder GPS nutzen.');
+  if (!leg) throw new FinalTripError('Diese Verbindung ist schon beendet – bitte eine aktuellere wählen oder GPS nutzen.');
 
   // Was laut Verbindung schon hinter mir liegt (z. B. Graben-Neudorf, wenn ich in der S9 sitze)
   const passed = conn.legs
@@ -98,22 +202,13 @@ export async function locateInConnection(client, conn, now) {
 
   if (leg.start > now) {
     // Noch nicht eingestiegen → ab der Einstiegshaltestelle planen
-    return { type: 'trip', place: { stopId: leg.fromStopId, name: leg.fromName }, time: leg.start, passed, label: `${leg.line} ab ${leg.fromName}`, tripId: leg.tripId };
+    return {
+      type: 'trip', place: { stopId: leg.fromStopId, name: leg.fromName }, time: leg.start, passed,
+      label: `${leg.line} ab ${leg.fromName}`, tripId: leg.tripId, notBoarded: true,
+      delayMin: leg.delayStartMin, realTime: leg.realTime,
+    };
   }
-
-  const trip = await client.trip(leg.tripId);
-  const { next, passed: passedInTrip } = nextStopOfTrip(trip, now);
-  if (!next?.stopId) throw new Error('Nächster Halt dieser Fahrt nicht ermittelbar.');
-  const time = Date.parse(next.arrival ?? next.departure);
-  return {
-    type: 'trip',
-    place: { stopId: next.stopId, name: next.name },
-    time: Math.max(now, time),
-    passed: [...passed, ...passedInTrip.map((p) => ({ name: p.name, stopId: p.stopId }))],
-    label: `${leg.line} → nächster Halt ${next.name}`,
-    tripId: leg.tripId,
-    arrivalScheduled: Date.parse(next.scheduledArrival ?? next.scheduledDeparture ?? next.arrival ?? next.departure),
-  };
+  return locateInTrip(client, leg.tripId, now, { alsoPassed: passed, board: { key: null, id: leg.fromStopId, expected: leg.fromName, name: leg.fromName } });
 }
 
 /**
@@ -139,12 +234,13 @@ export async function planJourney({ client, journey, stops, rules, now, realNow 
   if (start?.type === 'gps') {
     const me = { lat: start.lat, lon: start.lon };
     const target = stops[combos[0]?.to[0]];
-    combos = combinationsEnRoute(combos, (key) => isViaBehind(me, target, stops[key]));
+    combos = combinationsEnRoute(combos, (key) => isViaBehind(me, target, stops[key]), `${journey.label}: beliebige Route ab hier`);
     startInfo = { place: `${start.lat},${start.lon}`, time: now, maxPreTransitTime: rules.maxPreTransitSecondsFromGps };
   } else if (start?.type === 'trip') {
     const isPassed = (key) =>
+      key === start.boardKey ||
       placeMatchesStop(start.place, stops[key]) || start.passed.some((p) => placeMatchesStop(p, stops[key]));
-    combos = combinationsEnRoute(combos, isPassed);
+    combos = combinationsEnRoute(combos, isPassed, `${journey.label}: beliebige Route ab hier`);
     startInfo = { place: start.place.stopId, time: start.time, trip: start };
   }
 

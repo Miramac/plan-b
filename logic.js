@@ -72,6 +72,7 @@
  * @property {string} [toStopId]
  * @property {string} [label]
  * @property {boolean} [interline]  gleiches Fahrzeug wie das vorige Leg (sitzen bleiben, kein Umstieg)
+ * @property {boolean} [onDemand]   Rufbus/On-Demand (ggf. vorher anmelden)
  */
 
 /**
@@ -101,13 +102,16 @@
  * @property {number} arrDelayMin
  * @property {'full'|'partial'|'none'} realtime
  * @property {boolean} estimated
+ * @property {boolean} [onDemand]      enthält Rufbus/On-Demand-Fahrt
  * @property {boolean} usesBike
  * @property {number|null} bikeTime    Zeitpunkt der Radfahrt (für Wetter)
  * @property {boolean} [best]
  */
 
 const MIN = 60_000;
-const NON_TRANSIT = new Set(['WALK', 'BIKE', 'CAR', 'CAR_PARKING', 'CAR_DROPOFF', 'RENTAL', 'FLEX', 'ODM', 'DEBUG_BUS_ROUTE', 'DEBUG_RAILWAY_ROUTE', 'DEBUG_FERRY_ROUTE']);
+// ODM/FLEX (Rufbus, On-Demand) sind echte Fahrten und zählen als ÖPNV – werden aber markiert (Anmeldung nötig)
+const NON_TRANSIT = new Set(['WALK', 'BIKE', 'CAR', 'CAR_PARKING', 'CAR_DROPOFF', 'RENTAL', 'DEBUG_BUS_ROUTE', 'DEBUG_RAILWAY_ROUTE', 'DEBUG_FERRY_ROUTE']);
+const ON_DEMAND = new Set(['ODM', 'FLEX']);
 const STATION_WORDS = new Set(['bahnhof', 'bf', 'hbf', 'bahnhofsvorplatz']);
 
 // ---------------------------------------------------------------------------
@@ -262,16 +266,21 @@ export function buildCombinations(journey) {
  *
  * @param {Combination[]} combos
  * @param {(stopKey: string) => boolean} isPassed  true, wenn der Halt schon hinter mir liegt
+ * @param {string} [mergedName]  Name, wenn Varianten mit verschiedenen Etappen zusammenfallen
  * @returns {Combination[]}
  */
-export function combinationsEnRoute(combos, isPassed) {
+export function combinationsEnRoute(combos, isPassed, mergedName = 'Beliebige Route ab hier') {
   const groups = new Map();
   for (const c of combos) {
+    // Via-Halte sind in Fahrtreihenfolge: Liegt einer hinter mir, gilt das auch für alle davor
+    // (z. B. ab Bruchsal ist Graben-Neudorf erledigt, auch wenn ich dort nicht vorbeigekommen bin).
+    const lastPassed = c.via.reduce((acc, v, i) => (isPassed(v) ? i : acc), -1);
+    const via = c.via.slice(lastPassed + 1).filter((v) => !isPassed(v));
     const adapted = {
       ...c,
       from: [],
-      via: c.via.filter((v) => !isPassed(v)),
-      busTransferAt: c.busTransferAt.filter((v) => !isPassed(v)),
+      via,
+      busTransferAt: c.busTransferAt.filter((v) => via.includes(v) || (!c.via.includes(v) && !isPassed(v))),
       fixedBefore: null,
       usesBike: c.fixedAfter?.mode === 'bike',
     };
@@ -286,6 +295,7 @@ export function combinationsEnRoute(combos, isPassed) {
     let name = first.name;
     if (!sameS1 && sameS2) name = first.stage2Name;
     else if (sameS1 && !sameS2) name = first.stage1Name;
+    else if (!sameS1 && !sameS2) name = mergedName;
     return {
       ...first,
       id: group.map((g) => g.id).join('|'),
@@ -348,7 +358,8 @@ export const isTransitMode = (mode) => !NON_TRANSIT.has(mode);
 
 /**
  * Führt die Itineraries mehrerer Abfragen (z. B. zu beiden Arbeits-Haltestellen) zusammen:
- * gleiche Erstfahrt → nur die mit früherer Ankunft behalten; dann die nächsten N nach Abfahrt.
+ * gleiche Erstfahrt → nur die mit früherer Ankunft behalten (ist die nicht machbar: zusätzlich die beste
+ * machbare); dann die nächsten N nach Abfahrt.
  * @param {any[]} itineraries  MOTIS-Itineraries
  * @param {number} limit
  * @param {number} notBefore    frühestmögliche Abfahrt
@@ -370,14 +381,19 @@ export function mergeItineraries(itineraries, limit, notBefore = 0) {
   for (const group of groups.values()) {
     group.sort((a, b) => ms(a.endTime) - ms(b.endTime) || ms(b.startTime) - ms(a.startTime));
     out.push(group[0]);
-    if (hasMissedTransfer(group[0])) {
-      const alt = group.find((it) => !hasMissedTransfer(it));
+    if (isBroken(group[0])) {
+      const alt = group.find((it) => !isBroken(it));
       if (alt) out.push(alt);
     }
   }
   return out
     .sort((a, b) => firstTransitStart(a) - firstTransitStart(b) || ms(a.endTime) - ms(b.endTime))
     .slice(0, limit);
+}
+
+/** Laut Echtzeit nicht machbar: Anschluss verpasst oder eine Fahrt/ein Halt fällt aus. */
+function isBroken(it) {
+  return hasMissedTransfer(it) || (it.legs ?? []).some((l) => isTransitMode(l.mode) && (l.cancelled || l.from?.cancelled || l.to?.cancelled));
 }
 
 /** Ist ein Umstieg laut Echtzeit nicht mehr zu schaffen (Anschluss fährt vor Ankunft + Fußweg)? */
@@ -418,6 +434,7 @@ export function toDisplayLeg(l) {
     cancelled: !!(l.cancelled || l.from?.cancelled || l.to?.cancelled),
     tripId: l.tripId,
     interline: !!l.interlineWithPreviousLeg,
+    onDemand: ON_DEMAND.has(l.mode),
   };
 }
 
@@ -428,13 +445,24 @@ export function toDisplayLeg(l) {
  */
 export function placeMatchesStop(place, stop) {
   if (!stop || !place) return false;
+  // Deutsche Haltestellen-IDs (DHID) enthalten die Stationsnummer, z. B. "de-DELFI_de:08215:32585:4:4"
+  // → "de:08215:32585". Haben beide eine, entscheidet nur sie (sonst wäre "Graben-Neudorf Nord"
+  // dasselbe wie "Graben-Neudorf"). Bahnsteige und Bushalte am Bahnhof teilen die Stationsnummer.
+  const a = stationCode(place.stopId);
+  const b = stationCode(stop.id);
+  if (a && b) return a === b;
   if (stop.id && place.stopId) {
-    // DELFI-Bahnsteig-IDs hängen an der Stations-ID: "de:08226:3101:1:2" gehört zu "de:08226:3101"
     if (place.stopId === stop.id || place.parentId === stop.id || place.stopId.startsWith(`${stop.id}:`)) return true;
   }
   const want = tokens(stop.expected ?? stop.name).filter((t) => !STATION_WORDS.has(t));
   const have = new Set(tokens(place.name));
   return want.length > 0 && want.every((t) => have.has(t));
+}
+
+/** Stationsnummer aus einer Stop-ID ("de-KVV_Pde:08215:7702" → "de:08215:7702"), sonst null. */
+export function stationCode(id) {
+  const m = /([a-z]{2}:\d{5}:\d+)/.exec(id ?? '');
+  return m ? m[1] : null;
 }
 
 /**
@@ -587,7 +615,7 @@ export function overallRisk(risks) {
   return 'ok';
 }
 
-const isBus = (mode) => mode === 'BUS' || mode === 'COACH';
+const isBus = (mode) => mode === 'BUS' || mode === 'COACH' || ON_DEMAND.has(mode);
 
 /**
  * Passt das Itinerary zur Variante? An jedem busTransferAt-Halt muss zwischen Bus und Bahn umgestiegen
@@ -673,6 +701,7 @@ export function analyzeItinerary(it, combo, stops, rules, estimate = null) {
     arrDelayMin: lastT?.delayEndMin ?? 0,
     realtime: rtCount === 0 ? 'none' : rtCount === transit.length ? 'full' : 'partial',
     cancelled: transit.some((l) => l.cancelled),
+    onDemand: transit.some((l) => l.onDemand),
     estimated: !!estimate,
     usesBike: combo.usesBike,
     bikeTime,
@@ -763,16 +792,28 @@ export function weatherAt(data, time, t) {
  * Findet in der aktuellen Fahrt (Antwort von /trip) den nächsten Halt nach "now".
  * @param {any} tripItinerary  Itinerary aus /api/v6/trip
  * @param {number} now
- * @returns {{next: any|null, passed: any[]}}  next = MOTIS-Place mit stopId & Zeiten
+ * @returns {{next: any|null, passed: any[], terminus: any|null, endsEarly: boolean}}
+ *   next = nächster bedienter Halt (MOTIS-Place), terminus = letzter bedienter Halt, endsEarly = Zug endet vorzeitig
  */
 export function nextStopOfTrip(tripItinerary, now) {
+  const seq = tripSequence(tripItinerary);
+  if (!seq.length) return { next: null, passed: [], terminus: null, endsEarly: false };
+  // Ein Halt ist erst passiert, wenn der Zug dort ABGEFAHREN ist (steht er noch, ist er "nächster Halt").
+  // Entfallende Halte (cancelled) werden übersprungen – dort kann man weder aus- noch einsteigen.
+  const gone = (p) => ms(p.departure ?? p.arrival) <= now;
+  const served = seq.filter((p) => !p.cancelled);
+  const terminus = served[served.length - 1] ?? null; // letzter bedienter Halt (bei "endet vorzeitig" nicht das Fahrplan-Ziel)
+  const endsEarly = !!terminus && seq.indexOf(terminus) < seq.length - 1;
+  const idx = seq.findIndex((p) => !p.cancelled && !gone(p));
+  if (idx === -1) return { next: null, passed: served, terminus, endsEarly };
+  return { next: seq[idx], passed: seq.slice(0, idx).filter((p) => !p.cancelled), terminus, endsEarly };
+}
+
+/** Alle Halte einer Fahrt (Antwort von /trip) in Reihenfolge. */
+export function tripSequence(tripItinerary) {
   const leg = tripItinerary?.legs?.find((l) => isTransitMode(l.mode)) ?? tripItinerary?.legs?.[0];
-  if (!leg) return { next: null, passed: [] };
-  const seq = [leg.from, ...(leg.intermediateStops ?? []), leg.to].filter(Boolean);
-  const timeOf = (p) => ms(p.arrival ?? p.departure);
-  const idx = seq.findIndex((p) => timeOf(p) > now);
-  if (idx === -1) return { next: null, passed: seq };
-  return { next: seq[idx], passed: seq.slice(0, idx) };
+  if (!leg) return [];
+  return [leg.from, ...(leg.intermediateStops ?? []), leg.to].filter(Boolean);
 }
 
 /**
@@ -789,11 +830,15 @@ export function currentTransitLeg(conn, now) {
  * Nächster Handlungsschritt einer Verbindung ab "now" (für "Neue Empfehlung: …").
  * @param {Connection} conn
  * @param {number} now
+ * @param {string} [ridingTripId]  Fahrt, in der ich gerade sitze
  * @returns {{type:'board'|'change'|'arrive', stop:string, line?:string, headsign?:string, time:number}}
  */
-export function nextStep(conn, now) {
+export function nextStep(conn, now, ridingTripId) {
   const transit = conn.legs.filter((l) => l.kind === 'transit');
-  const riding = transit.findIndex((l) => l.start <= now && now < l.end);
+  // Unterwegs: sitze ich schon in der ersten Fahrt, gilt sie als "gerade gefahren" – auch wenn sie laut Plan erst gleich weiterfährt
+  const riding = ridingTripId && transit[0]?.tripId === ridingTripId
+    ? lastInterlined(transit, 0)
+    : transit.findIndex((l) => l.start <= now && now < l.end);
   if (riding >= 0) {
     const next = transit[riding + 1];
     return next
@@ -878,4 +923,152 @@ export function nextOccurrence(now, hhmm, { timeZone, weekdays, graceMinutes = 0
     if (add === 0 && now - t < graceMinutes * MIN) return now;
   }
   throw new Error(`Keine nächste Abfahrt für ${hhmm} gefunden`);
+}
+
+// ---------------------------------------------------------------------------
+// Unterwegs: "In welchem Zug sitze ich?" und "Wo steige ich am besten aus?"
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {Object} Departure
+ * @property {string} tripId
+ * @property {string} stopId         Bahnsteig/Halt der Abfahrt
+ * @property {string} line
+ * @property {string} headsign
+ * @property {string} mode
+ * @property {number} time           Abfahrt laut Echtzeit (sonst Fahrplan)
+ * @property {number} scheduledTime
+ * @property {number} delayMin
+ * @property {boolean} realTime
+ * @property {boolean} cancelled
+ */
+
+/**
+ * Abfahrten einer Haltestelle (Antwort von /stoptimes) für die Zugauswahl aufbereiten:
+ * nur die letzten pastMinutes bis nächsten futureMinutes, ohne Doppelte, nach Abfahrt sortiert.
+ * @param {any[]} stopTimes
+ * @param {number} now
+ * @param {{pastMinutes?: number, futureMinutes?: number}} [opts]
+ * @returns {Departure[]}
+ */
+export function recentDepartures(stopTimes, now, { pastMinutes = 60, futureMinutes = 20 } = {}) {
+  const seen = new Set();
+  return (stopTimes ?? [])
+    .filter((s) => s.place?.departure || s.place?.scheduledDeparture) // Endhalte haben keine Abfahrt
+    .map((s) => {
+      const scheduledTime = ms(s.place.scheduledDeparture ?? s.place.departure);
+      const time = ms(s.place.departure ?? s.place.scheduledDeparture);
+      return {
+        tripId: s.tripId,
+        stopId: s.place.stopId, // genauer Bahnsteig – für die Verortung in der Fahrt
+        line: s.displayName || s.routeShortName || s.tripShortName || s.mode,
+        headsign: s.headsign,
+        mode: s.mode,
+        time,
+        scheduledTime,
+        delayMin: Math.round((time - scheduledTime) / MIN),
+        realTime: !!s.realTime,
+        cancelled: !!(s.cancelled || s.tripCancelled),
+      };
+    })
+    .filter((d) => d.time >= now - pastMinutes * MIN && d.time <= now + futureMinutes * MIN)
+    .filter((d) => !seen.has(d.tripId) && seen.add(d.tripId))
+    .sort((a, b) => a.time - b.time);
+}
+
+/**
+ * Nächstgelegene Config-Haltestelle zu einer Position (für "Bahnhof per GPS").
+ * @param {Record<string, {lat?: number, lon?: number}>} stops
+ * @param {{lat: number, lon: number}} me
+ * @returns {string|null} Key aus STOPS
+ */
+export function nearestStopKey(stops, me) {
+  let best = null;
+  for (const [key, s] of Object.entries(stops)) {
+    if (s.lat == null || s.lon == null) continue;
+    const d = distanceKm(me, s);
+    if (!best || d < best.d) best = { key, d };
+  }
+  return best?.key ?? null;
+}
+
+/**
+ * Kommende Halte einer Fahrt (Antwort von /trip) ab "now", mit Echtzeit und Verspätung.
+ * @param {any} tripItinerary
+ * @param {number} now
+ * @returns {Array<{name: string, stopId: string, time: number, scheduledTime: number, delayMin: number, cancelled: boolean}>}
+ */
+export function upcomingStops(tripItinerary, now) {
+  return tripSequence(tripItinerary)
+    .filter((p) => ms(p.departure ?? p.arrival) > now) // noch nicht abgefahren
+    .map((p) => {
+      const time = ms(p.arrival ?? p.departure);
+      const scheduledTime = ms(p.scheduledArrival ?? p.scheduledDeparture ?? p.arrival ?? p.departure);
+      return { name: p.name, stopId: p.stopId, time, scheduledTime, delayMin: Math.round((time - scheduledTime) / MIN), cancelled: !!p.cancelled };
+    });
+}
+
+/**
+ * @typedef {Object} ExitOption
+ * @property {Connection} connection
+ * @property {DisplayLeg[]} onward   ÖPNV-Fahrten nach dem Ausstieg
+ * @property {{bufferMin: number, level: 'ok'|'tight'|'missed', critical: boolean}|null} transfer  Umstieg am Ausstieg
+ *
+ * @typedef {Object} ExitGroup
+ * @property {string} exitName       Hier aussteigen
+ * @property {number} exitTime       Ankunft dort (Echtzeit)
+ * @property {number} exitDelayMin
+ * @property {boolean} seated        bis zum Ziel sitzen bleiben (kein Umstieg mehr)
+ * @property {ExitOption[]} options  Weiterfahrten ab hier, beste zuerst
+ * @property {boolean} best          enthält die insgesamt beste Verbindung
+ */
+
+/**
+ * Unterwegs-Ansicht "Wo aussteigen?": Verbindungen nach dem Halt gruppieren, an dem ich meine
+ * aktuelle Fahrt verlasse. Reihenfolge entlang der Fahrt (frühester Ausstieg zuerst).
+ * @param {Connection[]} connections  bereits sortiert (rankConnections)
+ * @param {{tripId?: string, place: {name: string}, time: number, delayMin?: number}} start
+ * @param {number} tightMinutes
+ * @returns {ExitGroup[]}
+ */
+export function groupByExit(connections, start, tightMinutes) {
+  const groups = new Map();
+  for (const c of connections) {
+    const transit = c.legs.filter((l) => l.kind === 'transit');
+    if (!transit.length) continue;
+    const first = transit[0];
+    const seatedFirst = !!start.tripId && first.tripId === start.tripId;
+    let exit;
+    let option;
+    if (seatedFirst) {
+      // Ich bleibe zunächst sitzen (auch über eine umsteigefreie Weiterfahrt) und steige an last.toName aus
+      const lastIdx = lastInterlined(transit, 0);
+      const last = transit[lastIdx];
+      exit = { name: last.toName, time: last.end, delay: last.delayEndMin, seated: lastIdx === transit.length - 1 };
+      const r = c.risks[0];
+      option = { connection: c, onward: transit.slice(lastIdx + 1), transfer: r ? { bufferMin: r.bufferMin, level: r.level, critical: r.critical } : null };
+    } else {
+      // Aussteigen schon am nächsten Halt; Puffer = Abfahrt Anschluss − Ankunft − Fußweg dorthin
+      exit = { name: start.place.name, time: start.time, delay: start.delayMin ?? 0, seated: false };
+      const idx = c.legs.indexOf(first);
+      const walk = c.legs.slice(0, idx).filter((l) => l.kind === 'walk').reduce((sum, l) => sum + (l.end - l.start), 0);
+      const bufferMin = Math.floor((first.start - start.time - walk) / MIN);
+      option = { connection: c, onward: transit, transfer: { bufferMin, level: bufferMin < 0 ? 'missed' : bufferMin < tightMinutes ? 'tight' : 'ok', critical: false } };
+    }
+    const key = `${normalize(exit.name)}|${exit.seated}`;
+    if (!groups.has(key)) {
+      groups.set(key, { exitName: exit.name, exitTime: exit.time, exitDelayMin: exit.delay, seated: exit.seated, options: [], best: false });
+    }
+    const g = groups.get(key);
+    g.options.push(option);
+    if (c.best) g.best = true;
+  }
+  return [...groups.values()].sort((a, b) => a.exitTime - b.exitTime);
+}
+
+/** Index des letzten Legs, das ab transit[i] umsteigefrei (interline) weiterfährt. */
+function lastInterlined(transit, i) {
+  let j = i;
+  while (transit[j + 1]?.interline) j++;
+  return j;
 }

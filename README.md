@@ -31,7 +31,9 @@ Für GPS (Unterwegs-Modus) muss die Seite über HTTPS (oder localhost) laufen.
 
 - **Zur Arbeit / Nach Hause:** fragt alle Varianten der Richtung ab.
 - **Abfahrt:** *Jetzt* (mit Echtzeit), *Gewohnt* (nächster Werktag 7:30 bzw. 17:00, in `config.js` → `usualTime`) oder eigene *Uhrzeit*.
-- **Unterwegs:** neu planen ab GPS-Standort oder ab der Fahrt, in der du sitzt; optional Auto-Update alle 3 Minuten.
+- **Unterwegs → „Ich sitze in …“:** Bahnhof wählen (oder 📍 nächster Bahnhof per GPS), dann deinen Zug aus den Abfahrten der letzten Stunde antippen. Die App fragt die Fahrt live ab (Verspätung, entfallende Halte, vorzeitiges Ende) und zeigt **„Wo aussteigen?“**: je möglichem Ausstieg die beste Weiterfahrt mit Ankunft und Umstiegspuffer. Kommt der Zug erst noch, gibt es zusätzlich „Nicht einsteigen – stattdessen …“.
+- **Neu prüfen / Auto alle 3 Min.:** aktualisiert mit frischen Verspätungen; ändert sich die Empfehlung, erscheint „🔀 Neue Empfehlung“. Nach dem empfohlenen Ausstieg stoppt das Auto-Update und fragt nach dem neuen Zug.
+- **Ab Standort:** alternativ ab GPS-Position planen (im Zug oft ungenau).
 
 ## So funktioniert der Vergleich
 
@@ -54,7 +56,8 @@ Die Transitous-IDs sind fest in `config.js → STOPS` eingetragen, ermittelt per
   - MOTIS rechnet die Reserve in die Fußwege ein; die App zieht sie für die Anzeige wieder ab.
   - Fällt trotzdem etwas wegen zu knapper Umstiege weg (Umstieg außerhalb der Via-Halte), folgt eine zweite Abfrage mit voller Reserve.
 - **Verspätungen:** Bei „Jetzt“ und unterwegs fragt die App zusätzlich mit `realtimeMode=REALTIME_ANNOTATION_ONLY` ab (Routing nach Fahrplan, Echtzeit nur als Info). Eine Verspätung lässt eine Verbindung so nicht verschwinden, sondern markiert sie als „knapp“.
-- **Unterwegs:** Auch der Umstieg am nächsten Halt der aktuellen Fahrt wird gegen den Mindestpuffer geprüft; sitzen bleiben ist immer erlaubt.
+- **Unterwegs:** Auch der Umstieg am nächsten Halt der aktuellen Fahrt wird gegen den Mindestpuffer geprüft; sitzen bleiben ist immer erlaubt. Haltestellen werden über die Stationsnummer der DHID verglichen (`de:08215:32585`), damit z. B. „Graben-Neudorf Nord“ nicht als „Graben-Neudorf“ gilt.
+- **Rufbus:** On-Demand-Fahrten (`ODM`/`FLEX`) werden als Fahrt angezeigt und markiert („evtl. vorher anmelden“).
 - **Echtzeit:** Gibt es erst kurz vor der Fahrt. Abfragen für spätere Tage zeigen daher „keine Echtzeitdaten“.
 
 ## Nutzungsregeln Transitous

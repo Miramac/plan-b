@@ -3,8 +3,8 @@
 
 import { STOPS, OUTBOUND, RETURN, RULES, WEATHER, API, TIME } from './config.js';
 import { createTransitousClient, fetchWeather } from './api.js';
-import { resolveStops, planJourney, locateInConnection, choiceSignature } from './planner.js';
-import { nextStep, recommendationChanged, recommendationKey, nextOccurrence, weatherAt } from './logic.js';
+import { resolveStops, planJourney, locateInConnection, locateInTrip, departuresAt, choiceSignature, FinalTripError } from './planner.js';
+import { nextStep, recommendationChanged, recommendationKey, nextOccurrence, weatherAt, groupByExit, nearestStopKey, placeMatchesStop, normalize } from './logic.js';
 
 const $ = (sel) => document.querySelector(sel);
 const JOURNEYS = { outbound: OUTBOUND, return: RETURN };
@@ -31,7 +31,8 @@ const state = {
   lastBest: null, // recommendationKey der letzten Empfehlung – für "Neue Empfehlung"
   timeMode: store.get('timeMode') ?? 'now', // 'now' | 'usual' | 'custom'
   customTime: validTime(store.get('customTime')) ?? '07:30',
-  enRoute: { active: false, start: null, mode: null, tripConnection: null, timer: null, lastRun: 0 },
+  enRoute: { active: false, start: null, mode: null, tripConnection: null, tripId: null, pick: null, exit: null, session: 0, locating: false, timer: null, lastRun: 0 },
+  depSeq: 0, // gegen veraltete Abfahrtslisten bei schnellem Bahnhofswechsel
 };
 
 // ---------------------------------------------------------------------------
@@ -50,6 +51,7 @@ const modeIcon = (leg) => {
   if (leg.kind === 'bike') return '🚲';
   if (leg.kind === 'walk') return '🚶';
   if (leg.kind === 'estimate') return '🚌';
+  if (leg.onDemand) return '🚐';
   if (leg.mode === 'BUS' || leg.mode === 'COACH') return '🚌';
   if (leg.mode === 'TRAM') return '🚊';
   return '🚆';
@@ -98,8 +100,9 @@ function renderTimeHint() {
 /**
  * @param {'outbound'|'return'} journeyKey
  * @param {import('./planner.js').EnRouteStart} [start]
+ * @param {{session?: number}} [opts]  Unterwegs-Sitzung: Ergebnis verwerfen, wenn inzwischen beendet/gewechselt
  */
-async function run(journeyKey, start) {
+async function run(journeyKey, start, opts = {}) {
   if (state.busy) return;
   state.busy = true;
   state.journeyKey = journeyKey;
@@ -107,6 +110,7 @@ async function run(journeyKey, start) {
   setBusy(true);
   clearMessages();
   $('#results').innerHTML = `<li class="loading"><span class="spinner"></span>Frage Verbindungen ab …</li>`;
+  if (!start || start.type !== 'trip') $('#trip').innerHTML = '';
   $('#summary').textContent = '';
 
   renderTimeHint();
@@ -137,13 +141,18 @@ async function run(journeyKey, start) {
     const { connections, results } = await planJourney({
       client, journey, stops, rules: RULES, now, realNow, start, weather, weatherThresholds: WEATHER.goodBikeWeather,
     });
+    // Unterwegs beendet oder anderen Zug gewählt, während gesucht wurde → Ergebnis verwerfen
+    if (opts.session !== undefined && (opts.session !== state.enRoute.session || !state.enRoute.active)) {
+      $('#results').innerHTML = '';
+      return;
+    }
     state.connections = connections;
     state.results = results;
 
     // 3) Unterwegs: Empfehlungswechsel deutlich anzeigen
     const best = connections.find((c) => c.best);
     if (start && recommendationChanged(state.lastBest, best, realNow)) {
-      message('change', `🔀 Neue Empfehlung: ${esc(describeStep(best, realNow))}`);
+      message('change', `🔀 Neue Empfehlung: ${esc(describeStep(best, realNow, start))}`);
       try { navigator.vibrate?.(200); } catch { /* egal */ }
     }
     // Vergleichsbasis für "Neue Empfehlung" nur aus aktuellen (nicht geplanten) Abfragen
@@ -160,6 +169,8 @@ async function run(journeyKey, start) {
     }
 
     renderResults(connections, results, !!start, realNow);
+    if (start?.type === 'trip') state.enRoute.exit = renderTrip(start, connections, realNow);
+    else $('#trip').innerHTML = '';
     const from = start ? ` · ab ${start.type === 'gps' ? 'Standort' : start.label}` : ` · ab ${fmtWhen(now, realNow)}`;
     $('#summary').textContent = `${journey.label}${from} · Stand ${fmtTime(realNow)} · ${connections.length} Verbindungen aus ${results.length} Varianten`;
     fillTripSelect();
@@ -174,8 +185,9 @@ async function run(journeyKey, start) {
 }
 
 /** Satz für "Neue Empfehlung: …" */
-function describeStep(conn, now) {
-  const s = nextStep(conn, now);
+function describeStep(conn, now, start) {
+  // Sitze ich schon in der ersten Fahrt, heißt der nächste Schritt "aussteigen in …", nicht "einsteigen"
+  const s = nextStep(conn, now, start?.notBoarded ? undefined : start?.tripId);
   const line = s.line ? `${s.line}${s.headsign ? ` Richtung ${s.headsign}` : ''}` : '';
   if (s.type === 'change') return `in ${s.stop} aussteigen und ${line} um ${fmtTime(s.time)} nehmen (${conn.name}).`;
   if (s.type === 'arrive') return `sitzen bleiben bis ${s.stop} (${conn.name}).`;
@@ -188,11 +200,14 @@ function setBusy(on) {
     b.classList.toggle('busy', on);
     if (on) b.disabled = true;
   }
+  // Während einer Suche keine zweite Zugauswahl (sonst passen Status und Ergebnis nicht zusammen)
+  for (const el of document.querySelectorAll('#departures button.dep, #btn-trip, #btn-station-gps, #sel-station')) el.disabled = on;
   if (!on) {
     $('#btn-outbound').disabled = false;
     $('#btn-return').disabled = false;
     $('#btn-gps').disabled = false;
     $('#btn-refresh').disabled = !state.enRoute.start;
+    $('#btn-trip').disabled = !$('#sel-trip').value;
   }
 }
 
@@ -236,6 +251,7 @@ function connectionCard(c, rank, now) {
   if (c.realtime === 'none' && soon) badges.push('<span class="badge info">keine Echtzeitdaten</span>');
   else if (c.realtime === 'partial' && soon) badges.push('<span class="badge info">Echtzeit nur teilweise</span>');
   if (c.estimated) badges.push('<span class="badge info">Ankunft geschätzt</span>');
+  if (c.onDemand) badges.push('<span class="badge tight">📞 Rufbus – evtl. vorher anmelden</span>');
   if (c.usesBike) {
     const w = c.weather;
     badges.push(w
@@ -287,7 +303,7 @@ function legsHtml(c, now) {
       const lateEnd = l.delayEndMin !== 0 ? ` <span class="late">${delayText(l.delayEndMin)}</span>` : '';
       const noRt = !l.realTime && l.start < now + 60 * 60_000 ? ' · ohne Echtzeit' : ''; // bei geplanten Fahrten normal
       out.push(`<li class="leg"><span class="lt">${fmtTime(l.start)}</span><span>${modeIcon(l)}</span>
-        <span class="ld"><span class="line">${esc(l.line)}</span>${esc(l.fromName)}${late}
+        <span class="ld"><span class="line">${esc(l.line)}</span>${l.onDemand ? '(Rufbus) ' : ''}${esc(l.fromName)}${late}
         <small>${l.headsign ? `Richtung ${esc(l.headsign)} · ` : ''}an ${esc(l.toName)} ${fmtTime(l.end)}${lateEnd}${noRt}${l.cancelled ? ' · <b>fällt aus</b>' : ''}</small></span></li>`);
     } else if (l.label) {
       out.push(`<li class="leg"><span class="lt">${fmtTime(l.start)}</span><span>${modeIcon(l)}</span><span class="ld">${esc(l.label)}<small>bis ${fmtTime(l.end)}</small></span></li>`);
@@ -296,6 +312,75 @@ function legsHtml(c, now) {
     }
   }
   return out.join('');
+}
+
+// ---------------------------------------------------------------------------
+// Rendering: Unterwegs in einer Fahrt – aktuelle Fahrt + "Wo aussteigen?"
+// ---------------------------------------------------------------------------
+/**
+ * @param {import('./planner.js').EnRouteStart} start
+ * @param {import('./logic.js').Connection[]} connections
+ */
+function renderTrip(start, connections, now) {
+  const isKey = (stop) => Object.values(state.stops ?? {}).some((s) => placeMatchesStop(stop, s));
+  const delay = !start.realTime
+    ? ' <span class="badge info">ohne Echtzeit</span>'
+    : start.delayMin ? ` <span class="late">${delayText(start.delayMin)} Min.</span>` : ' <span class="ontime">pünktlich</span>';
+  const where = start.notBoarded
+    ? `Abfahrt in ${esc(start.place.name)} um ${fmtTime(start.time)}`
+    : !start.tripId ? `Zug endet in ${esc(start.place.name)} – ab hier weiter`
+      : `Nächster Halt ${esc(start.place.name)} um ${fmtTime(start.time)}`;
+  const early = (start.boardCancelled ? `<p class="msg error">⚠️ Dieser Zug hält in ${esc(start.place.name)} nicht.</p>` : '') +
+    (start.endsEarly && start.terminus ? `<p class="msg warn">⚠️ Zug endet vorzeitig in ${esc(start.terminus)}.</p>` : '');
+  const stopsHtml = (start.upcoming ?? []).slice(0, 8).map((p) => `
+    <li class="${isKey(p) ? 'key' : ''}"><span>${fmtTime(p.time)}</span><span>${esc(p.name)}${p.cancelled ? ' · <b>entfällt</b>' : ''}</span>
+    <span class="${p.delayMin > 0 ? 'late' : 'meta'}">${p.delayMin ? delayText(p.delayMin) : ''}</span></li>`).join('');
+
+  const groups = groupByExit(connections.filter((c) => !c.cancelled), start, RULES.tightTransferMinutes);
+  const exitsHtml = groups.map((g) => {
+    const atStart = !g.seated && g.exitName === start.place.name;
+    // Nur sinnvolle Optionen: höchstens 30 Min. später als die beste ab diesem Halt
+    const shown = g.options.filter((o) => o.connection.arrival <= g.options[0].connection.arrival + 30 * 60_000).slice(0, 3);
+    const opts = shown.map(({ connection: c, onward, transfer }) => {
+      const chain = onward.map((l) => `${esc(l.line)}${l.onDemand ? ' (Rufbus)' : ''} ${fmtTime(l.start)}`).join(' → ');
+      const tail = c.legs[c.legs.length - 1];
+      const extra = tail.kind === 'bike' ? ' → 🚲' : tail.kind === 'estimate' ? ' → 🚌 (geschätzt)' : '';
+      let badge = '';
+      if (transfer && transfer.level !== 'ok') {
+        const cls = transfer.level === 'missed' || transfer.critical ? 'critical' : 'tight';
+        badge = `<span class="badge ${cls}">${transfer.level === 'missed' ? 'Anschluss weg' : `knapp: ${transfer.bufferMin} Min.`}${transfer.critical ? ' · Bus stündlich' : ''}</span>`;
+      } else if (transfer) badge = `<span class="badge">${transfer.bufferMin} Min. ${atStart && start.notBoarded ? 'Wartezeit' : 'Puffer'}</span>`;
+      return `<div class="opt">${chain ? `<span>→ ${chain}${extra}</span>` : `<span>sitzen bleiben${extra}</span>`}
+        <span class="arr">an ${fmtTime(c.arrival)}</span>${badge}<span class="via">${esc(c.name)}</span></div>`;
+    }).join('');
+    const more = g.options.length > shown.length ? `<p class="meta">+ ${g.options.length - shown.length} spätere (unten in „Alle Verbindungen“)</p>` : '';
+    const what = g.seated ? `Sitzen bleiben bis <b>${esc(g.exitName)}</b>`
+      : atStart && start.notBoarded ? `Nicht einsteigen – stattdessen ab <b>${esc(g.exitName)}</b>`
+        : atStart && !start.tripId ? `Umsteigen in <b>${esc(g.exitName)}</b>`
+          : `Aussteigen in <b>${esc(g.exitName)}</b>`;
+    return `<li class="exit${g.best ? ' best' : ''}">
+      ${g.best ? '<span class="best-tag">★ Empfehlung</span>' : ''}
+      <div class="exit-head"><span>${what}</span><span class="t">${fmtTime(g.exitTime)}${g.exitDelayMin ? ` <span class="late">${delayText(g.exitDelayMin)}</span>` : ''}</span></div>
+      ${opts}${more}</li>`;
+  }).join('');
+
+  $('#trip').innerHTML = `
+    <div class="card trip-card">
+      <div class="trip-head"><span>🚆 <b>${esc(start.label)}</b></span>${delay}</div>
+      <p class="meta">${where} · Stand ${fmtTime(now)}</p>
+      ${early}
+      ${stopsHtml ? `<ol class="trip-stops">${stopsHtml}</ol>` : ''}
+    </div>
+    <h3 class="exits-title">Wo aussteigen?</h3>
+    ${exitsHtml ? `<ol class="exits">${exitsHtml}</ol>` : '<p class="msg warn">Keine passende Weiterfahrt ab dieser Fahrt gefunden.</p>'}
+    <h3 class="results-title">Alle Verbindungen</h3>`;
+
+  // Empfohlener Ausstieg: danach ist der Fahrgast (wahrscheinlich) umgestiegen → Aktualisierung anpassen
+  const best = groups.find((g) => g.best);
+  if (!best || best.seated) return null;
+  // "Nicht einsteigen": sobald der Zug weg ist, nicht so tun, als säße ich drin
+  if (start.notBoarded && best.exitName === start.place.name) return { name: best.exitName, time: best.exitTime, notBoarded: true };
+  return { name: best.exitName, time: best.exitTime };
 }
 
 function renderWeather(w, time, realNow) {
@@ -363,18 +448,125 @@ function selectedDirection() {
 
 function setEnRoute(active) {
   state.enRoute.active = active;
+  state.enRoute.session++; // laufende Unterwegs-Abfragen werden damit ungültig
   $('#enroute-body').hidden = !active;
   $('#enroute').classList.toggle('active', active);
   $('#btn-enroute').hidden = active;
   if (active) {
     document.querySelector(`input[name="dir"][value="${state.journeyKey}"]`).checked = true;
+    fillStationSelect();
+    loadDepartures();
   } else {
     state.enRoute.start = null;
     state.enRoute.tripConnection = null;
+    state.enRoute.tripId = null;
+    state.enRoute.pick = null;
+    state.enRoute.exit = null;
+    state.lastBest = null;
+    $('#departures').innerHTML = '';
+    $('#trip').innerHTML = '';
     $('#chk-auto').checked = false;
     stopAuto();
     $('#enroute-status').textContent = '';
     $('#btn-refresh').disabled = true;
+  }
+}
+
+/** Haltestellen bereitstellen (ohne Netz, wenn alle IDs in config.js stehen). */
+async function ensureStops() {
+  if (!state.stops) state.stops = await resolveStops(client, STOPS, { cache: store, choices: store.get('choices') ?? {} });
+  return state.stops;
+}
+
+/** Bahnhofsauswahl füllen: Bahnhöfe zuerst, Standard je Richtung. */
+function fillStationSelect() {
+  const keys = Object.keys(STOPS).sort((a, b) => Number(!!STOPS[b].rail) - Number(!!STOPS[a].rail));
+  const def = selectedDirection() === 'outbound' ? 'grabenNeudorf' : 'wieslochWalldorf';
+  $('#sel-station').innerHTML = keys.map((k) => `<option value="${esc(k)}"${k === def ? ' selected' : ''}>${esc(STOPS[k].name)}${STOPS[k].rail ? '' : ` (${esc(STOPS[k].place)})`}</option>`).join('');
+}
+
+/** Abfahrten am gewählten Bahnhof laden (eine Abfrage, nur auf Nutzeraktion). */
+async function loadDepartures() {
+  const box = $('#departures');
+  const seq = ++state.depSeq;
+  const key = $('#sel-station').value;
+  box.innerHTML = '<p class="hint"><span class="spinner"></span>Lade Abfahrten …</p>';
+  try {
+    const stops = await ensureStops();
+    const stop = stops[key];
+    if (!stop?.id) throw new Error('Haltestelle nicht geklärt – siehe „Haltestellen“.');
+    const now = Date.now();
+    const deps = await departuresAt(client, stop.id, now);
+    if (seq !== state.depSeq) return; // inzwischen anderer Bahnhof gewählt
+    if (!deps.length) { box.innerHTML = '<p class="hint">Keine Abfahrten in der letzten Stunde.</p>'; return; }
+    box.innerHTML = deps.map((d, i) => `
+      <button type="button" class="dep${d.time < now ? ' past' : ''}${d.cancelled ? ' cancelled' : ''}" data-i="${i}">
+        <span class="lt">${fmtTime(d.time)}</span><span class="line">${esc(d.line)}</span>
+        <span class="hs">→ ${esc(d.headsign)}</span>
+        <span class="${d.delayMin > 0 ? 'late' : 'meta'}">${d.delayMin ? delayText(d.delayMin) : d.realTime ? '' : '·'}</span>
+      </button>`).join('');
+    if (state.busy || state.enRoute.locating) box.querySelectorAll('button.dep').forEach((b) => { b.disabled = true; });
+    box.querySelectorAll('button.dep').forEach((b) => b.addEventListener('click', () => {
+      const d = deps[Number(b.dataset.i)];
+      planFromTripId(d.tripId, { pick: { board: stop, boardStopId: d.stopId, label: `${d.line} → ${d.headsign}` } });
+    }));
+  } catch (e) {
+    if (seq !== state.depSeq) return;
+    box.innerHTML = `<p class="msg error">❌ ${esc(e.message)}</p>`;
+  }
+}
+
+/** 📍: nächsten Bahnhof aus config.js per GPS vorauswählen. */
+async function pickStationByGps() {
+  try {
+    const pos = await getPosition();
+    const key = nearestStopKey(await ensureStops(), pos);
+    if (key) { $('#sel-station').value = key; await loadDepartures(); }
+  } catch (e) {
+    $('#departures').innerHTML = `<p class="msg error">📍 ${esc(e.message)}</p>`;
+  }
+}
+
+/**
+ * Ich sitze in dieser Fahrt → ab dem nächsten Halt planen, Ausstiegs-Alternativen zeigen.
+ * @param {string} tripId
+ * @param {{pick?: {board?: any, boardStopId?: string, label?: string}, userInitiated?: boolean, checkExit?: boolean}} [opts]
+ *   pick = Auswahl aus der Abfahrtsliste (Einstiegsbahnhof, Bahnsteig, angezeigter Zugname)
+ *   checkExit = Auto-Update: prüfen, ob ich laut Empfehlung schon ausgestiegen bin
+ */
+async function planFromTripId(tripId, { pick = state.enRoute.pick, userInitiated = true, checkExit = false } = {}) {
+  if (state.busy || state.enRoute.locating) return;
+  const session = state.enRoute.session;
+  state.enRoute.locating = true;
+  setBusy(true);
+  try {
+    $('#enroute-status').textContent = 'Frage aktuelle Fahrt ab …';
+    await ensureStops();
+    const start = await locateInTrip(client, tripId, Date.now(), pick ?? {});
+    if (session !== state.enRoute.session) return; // inzwischen beendet
+    // Automatische Prüfung: liegt der empfohlene Ausstieg (oder der nicht genommene Einstieg) schon hinter dem Zug?
+    const exit = state.enRoute.exit;
+    if (checkExit && exit && (start.passed.some((p) => normalize(p.name) === normalize(exit.name)) ||
+        (exit.notBoarded && !start.notBoarded))) {
+      suggestNewTrain(exit);
+      return;
+    }
+    if (userInitiated) state.lastBest = null; // eigene Auswahl ist keine "neue Empfehlung"
+    Object.assign(state.enRoute, { mode: 'trip', tripId, pick, tripConnection: null, start });
+    $('#enroute-status').textContent = `In ${start.label} · ${start.notBoarded ? 'Abfahrt' : 'nächster Halt'} ${start.place.name} ${fmtTime(start.time)}`;
+    state.enRoute.locating = false;
+    setBusy(false);
+    await run(selectedDirection(), start, { session });
+    if (userInitiated && session === state.enRoute.session) $('#trip').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    if (session !== state.enRoute.session) return;
+    clearMessages();
+    message('error', `🚆 ${esc(e.message)}`);
+    $('#enroute-status').textContent = '';
+    if (e instanceof FinalTripError) stopAutoAndUncheck(); // Netzwerkfehler (Tunnel …): Auto-Update läuft weiter
+  } finally {
+    state.enRoute.locating = false;
+    if (!state.busy) setBusy(false);
   }
 }
 
@@ -404,49 +596,104 @@ function getPosition() {
   });
 }
 
-async function planFromGps() {
+async function planFromGps({ userInitiated = true } = {}) {
+  if (state.busy || state.enRoute.locating) return;
+  const session = state.enRoute.session;
+  state.enRoute.locating = true;
+  setBusy(true);
   try {
     $('#enroute-status').textContent = 'Bestimme Standort …';
     const pos = await getPosition();
-    state.enRoute.mode = 'gps';
+    if (session !== state.enRoute.session) return;
+    state.enRoute.locating = false;
+    setBusy(false);
+    if (userInitiated) state.lastBest = null;
+    Object.assign(state.enRoute, { mode: 'gps', tripId: null, tripConnection: null, pick: null, exit: null });
     state.enRoute.start = { type: 'gps', lat: pos.lat, lon: pos.lon };
-    $('#enroute-status').textContent = `Standort ±${Math.round(pos.accuracy)} m · im Zug ungenau? Dann „Ich sitze gerade in …“ nutzen.`;
-    await run(selectedDirection(), state.enRoute.start);
+    $('#enroute-status').textContent = `Standort ±${Math.round(pos.accuracy)} m · im Zug ungenau? Dann unter „Ich sitze in …“ deinen Zug wählen.`;
+    await run(selectedDirection(), state.enRoute.start, { session });
   } catch (e) {
+    if (session !== state.enRoute.session) return;
     clearMessages();
     message('error', `📍 ${esc(e.message)}`);
     $('#enroute-status').textContent = '';
+  } finally {
+    state.enRoute.locating = false;
+    if (!state.busy) setBusy(false);
   }
 }
 
-async function planFromTrip(conn) {
+async function planFromTrip(conn, { userInitiated = true } = {}) {
+  if (state.busy || state.enRoute.locating) return;
+  const session = state.enRoute.session;
+  state.enRoute.locating = true;
+  setBusy(true);
   try {
     $('#enroute-status').textContent = 'Frage aktuelle Fahrt ab …';
+    // Die Verbindung bleibt die Grundlage: nach dem Umstieg wird so automatisch die nächste Fahrt verfolgt
     const start = await locateInConnection(client, conn, Date.now());
-    state.enRoute.mode = 'trip';
-    state.enRoute.tripConnection = conn;
-    state.enRoute.start = start;
+    if (session !== state.enRoute.session) return;
+    state.enRoute.locating = false;
+    setBusy(false);
+    if (userInitiated) state.lastBest = null;
+    Object.assign(state.enRoute, { mode: 'trip', tripId: null, pick: null, exit: null, tripConnection: conn, start });
     $('#enroute-status').textContent = `In ${start.label} (ab ${fmtTime(start.time)})`;
-    await run(selectedDirection(), start);
+    await run(selectedDirection(), start, { session });
+    state.enRoute.exit = null; // Verbindung verfolgt den Umstieg selbst
   } catch (e) {
+    if (session !== state.enRoute.session) return;
     clearMessages();
     message('error', `🚆 ${esc(e.message)}`);
     $('#enroute-status').textContent = '';
+    if (e instanceof FinalTripError) stopAutoAndUncheck();
+  } finally {
+    state.enRoute.locating = false;
+    if (!state.busy) setBusy(false);
   }
 }
 
-/** "Neu prüfen": gleicher Modus, frische Daten (GPS neu bzw. Fahrt neu abfragen). */
-function refresh() {
-  if (state.busy) return;
-  if (state.enRoute.mode === 'gps') return planFromGps();
-  if (state.enRoute.mode === 'trip' && state.enRoute.tripConnection) return planFromTrip(state.enRoute.tripConnection);
+/**
+ * "Neu prüfen": gleicher Modus, frische Daten (GPS neu bzw. Fahrt neu abfragen).
+ * @param {boolean} fromUser  Knopf gedrückt (true) oder Auto-Update (false)
+ */
+function refresh(fromUser = true) {
+  if (state.busy || state.enRoute.locating) return;
+  const opts = { userInitiated: false };
+  if (state.enRoute.mode === 'gps') return planFromGps(opts);
+  if (state.enRoute.mode === 'trip' && state.enRoute.tripId) {
+    // Empfohlener Ausstieg liegt hinter uns → vermutlich umgestiegen: nicht den alten Zug weiterverfolgen
+    const exit = state.enRoute.exit;
+    if (!fromUser && exit && Date.now() > exit.time + 2 * 60_000) {
+      suggestNewTrain(exit);
+      return;
+    }
+    return planFromTripId(state.enRoute.tripId, { ...opts, checkExit: !fromUser });
+  }
+  if (state.enRoute.mode === 'trip' && state.enRoute.tripConnection) return planFromTrip(state.enRoute.tripConnection, opts);
+}
+
+/** Nach (vermutetem) Umstieg oder nicht genommenem Zug: Auto-Update stoppen, neuen Zug wählen lassen. */
+function suggestNewTrain(exit) {
+  stopAutoAndUncheck();
+  clearMessages();
+  message('info', exit.notBoarded
+    ? `🔁 Du bist laut Empfehlung nicht eingestiegen. Wähle oben deinen neuen Zug.`
+    : `🔁 Laut Empfehlung bist du in ${esc(exit.name)} umgestiegen. Wähle oben deinen neuen Zug – oder „Neu prüfen“, falls du noch im alten sitzt.`);
+  const key = Object.keys(STOPS).find((k) => placeMatchesStop({ name: exit.name }, state.stops?.[k]));
+  if (key) { $('#sel-station').value = key; loadDepartures(); }
+  $('#enroute').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function stopAutoAndUncheck() {
+  stopAuto();
+  $('#chk-auto').checked = false;
 }
 
 // Auto-Update: nur solange Modus aktiv UND Seite sichtbar (schont Akku und Transitous).
 function startAuto() {
   stopAuto();
   state.enRoute.timer = setInterval(() => {
-    if (document.visibilityState === 'visible' && state.enRoute.active && state.enRoute.start) refresh();
+    if (document.visibilityState === 'visible' && state.enRoute.active && state.enRoute.start) refresh(false);
   }, RULES.autoRefreshMinutes * 60_000);
 }
 function stopAuto() {
@@ -456,7 +703,7 @@ function stopAuto() {
 document.addEventListener('visibilitychange', () => {
   // Zurück auf der Seite und Prüfung überfällig → sofort aktualisieren
   if (document.visibilityState === 'visible' && state.enRoute.timer && state.enRoute.start &&
-      Date.now() - state.enRoute.lastRun > RULES.autoRefreshMinutes * 60_000) refresh();
+      Date.now() - state.enRoute.lastRun > RULES.autoRefreshMinutes * 60_000) refresh(false);
 });
 
 // ---------------------------------------------------------------------------
@@ -466,8 +713,11 @@ $('#btn-outbound').addEventListener('click', () => { if (state.enRoute.active) s
 $('#btn-return').addEventListener('click', () => { if (state.enRoute.active) setEnRoute(false); run('return'); });
 $('#btn-enroute').addEventListener('click', () => setEnRoute(true));
 $('#btn-enroute-stop').addEventListener('click', () => setEnRoute(false));
-$('#btn-gps').addEventListener('click', planFromGps);
-$('#btn-refresh').addEventListener('click', refresh);
+$('#btn-gps').addEventListener('click', () => planFromGps());
+$('#sel-station').addEventListener('change', loadDepartures);
+$('#btn-station-gps').addEventListener('click', pickStationByGps);
+document.querySelectorAll('input[name="dir"]').forEach((r) => r.addEventListener('change', () => { fillStationSelect(); loadDepartures(); }));
+$('#btn-refresh').addEventListener('click', () => refresh(true));
 $('#sel-trip').addEventListener('change', (e) => { $('#btn-trip').disabled = !e.target.value; });
 $('#btn-trip').addEventListener('click', () => {
   const conn = state.connections.find((c) => c.id === $('#sel-trip').value);

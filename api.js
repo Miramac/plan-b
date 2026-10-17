@@ -113,6 +113,15 @@ export function createTransitousClient({ baseUrl, maxParallel = 4, fetchImpl = g
     },
 
     /**
+     * Abfahrten an einer Haltestelle ab "time" (für die Zugauswahl unterwegs).
+     * @param {{stopId: string, time: number, n?: number}} q
+     * @returns {Promise<{stopTimes: any[], place: any}>}
+     */
+    stoptimes(q) {
+      return call('/api/v6/stoptimes', { stopId: q.stopId, time: new Date(q.time).toISOString(), n: q.n ?? 40, language: 'de' });
+    },
+
+    /**
      * Eine konkrete Fahrt mit allen Halten und Echtzeit (für "Ich sitze gerade in …").
      * @param {string} tripId
      */

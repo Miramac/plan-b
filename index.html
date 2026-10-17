@@ -49,11 +49,20 @@
           <button type="button" id="btn-gps">📍 Ab meinem Standort planen</button>
         </div>
         <div class="row col">
-          <label class="label" for="sel-trip">Ich sitze gerade in …</label>
+          <span class="label">Ich sitze in …</span>
           <div class="inline">
-            <select id="sel-trip"><option value="">– erst eine Abfrage starten –</option></select>
-            <button type="button" id="btn-trip" disabled>Ab nächstem Halt planen</button>
+            <select id="sel-station" aria-label="Bahnhof, an dem du eingestiegen bist oder den du zuletzt passiert hast"></select>
+            <button type="button" id="btn-station-gps" aria-label="Nächsten Bahnhof per GPS wählen">📍</button>
           </div>
+          <p class="hint">Bahnhof wählen, an dem du eingestiegen bist (oder den du zuletzt passiert hast), dann deinen Zug antippen.</p>
+          <div id="departures" class="departures" aria-live="polite"></div>
+          <details class="more">
+            <summary>… oder aus der letzten Abfrage</summary>
+            <div class="inline">
+              <select id="sel-trip" aria-label="Verbindung aus der letzten Abfrage"><option value="">– erst eine Abfrage starten –</option></select>
+              <button type="button" id="btn-trip" disabled>Ab nächstem Halt planen</button>
+            </div>
+          </details>
         </div>
         <div class="row">
           <button type="button" id="btn-refresh" disabled>🔄 Neu prüfen</button>
@@ -66,6 +75,7 @@
 
     <div id="messages" aria-live="polite"></div>
     <div id="weather"></div>
+    <div id="trip"></div>
     <div id="summary"></div>
     <ol id="results" class="results"></ol>
 
