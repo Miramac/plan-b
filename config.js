@@ -122,7 +122,11 @@ export const RULES = {
   minBufferMinutes: 3, // Umstiege mit weniger Puffer (laut Fahrplan) nie nutzen – Ausnahmen: minBufferAt
   tightTransferMinutes: 5, // Puffer darunter = "knapp" (inkl. Echtzeit)
   viaMinimumStayMinutes: 1, // erzwingt Aussteigen am Via-Halt (bei 0 zählt auch Durchfahren)
-  connectionsPerVariant: 3, // nächste N Verbindungen je Kombination (Anzeige)
+  connectionsPerVariant: 3, // unterwegs: nächste N Verbindungen je Kombination (Alternativen)
+  // Normale Suche (Jetzt / Gewohnt / Uhrzeit): Abfahrtszeit steht fest → je Variante nur die beste Verbindung,
+  // die höchstens maxWaitMinutes nach der gewünschten Abfahrt startet. Spätere Abfahrten werden ausgeblendet.
+  maxWaitMinutes: 30,
+  perVariant: 1,
   itinerariesPerQuery: 5, // so viele je Abfrage holen – einige fallen durch die Umstiegsregeln weg
   maxParallelRequests: 4, // schont die Transitous-API
   autoRefreshMinutes: 3, // Unterwegs-Modus

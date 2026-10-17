@@ -222,10 +222,12 @@ function renderResults(connections, results, enRoute, now) {
   // Varianten ohne Ergebnis: ausgegraut statt ausgeblendet
   for (const r of results.filter((x) => x.status !== 'ok')) {
     const li = document.createElement('li');
-    li.className = 'conn dim';
-    let why = r.status === 'error' ? esc(r.error) : enRoute ? 'nicht mehr erreichbar' : 'keine passende Verbindung gefunden';
-    if (r.dropped?.buffer) why += ` · ${r.dropped.buffer} wegen zu knappem Umstieg (unter ${RULES.minBufferMinutes} Min. Puffer) verworfen`;
-    li.innerHTML = `<div class="conn-head"><span class="variant">${esc(r.combo.name)}</span></div><p class="meta">${why}</p>`;
+    li.className = 'conn dim compact';
+    let why = r.status === 'error' ? esc(r.error)
+      : r.status === 'late' ? `erst ab ${fmtTime(r.nextDeparture)}`
+        : enRoute ? 'nicht mehr erreichbar' : 'keine passende Verbindung gefunden';
+    if (r.status === 'empty' && r.dropped?.buffer) why += ` · ${r.dropped.buffer} wegen zu knappem Umstieg (unter ${RULES.minBufferMinutes} Min. Puffer) verworfen`;
+    li.innerHTML = `<span class="variant">${esc(r.combo.name)}</span><span class="meta">${why}</span>`;
     list.append(li);
   }
   if (!list.children.length) list.innerHTML = '<li class="loading">Keine Verbindungen gefunden.</li>';

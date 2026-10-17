@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { STOPS, OUTBOUND, RETURN, RULES, WEATHER } from '../config.js';
 import {
   normalize, pickStopMatch, buildCombinations, combinationsEnRoute, analyzeTransfers,
-  weatherAt, rankConnections, fitsVariant, meetsMinBuffer, nextOccurrence, withoutTransferReserve,
+  weatherAt, rankConnections, fitsVariant, forDeparture, meetsMinBuffer, nextOccurrence, withoutTransferReserve,
   mergeItineraries, meetsStartBuffer, zonedTime, requiredBuffer,
   recentDepartures, nearestStopKey, upcomingStops, groupByExit, analyzeItinerary, nextStopOfTrip as nextStop, combinationsEnRoute as enRoute, nextStep, recommendationChanged, recommendationKey, nextStopOfTrip,
 } from '../logic.js';
@@ -139,7 +139,7 @@ test('planJourney Hinweg: Kombinationen, Rad-Zeitversatz, Rangliste, mehrdeutige
 
   const weather = { current: { time: NOW, temperature: 15, precipitation: 0, wind: 5 }, hourly: [] };
   const { connections, results } = await planJourney({
-    client, journey: OUTBOUND, stops, rules: RULES, now: NOW, weather, weatherThresholds: WEATHER.goodBikeWeather,
+    client, journey: OUTBOUND, stops, rules: { ...RULES, maxWaitMinutes: null }, now: NOW, weather, weatherThresholds: WEATHER.goodBikeWeather,
   });
 
   // A3 (Oftersheim) nicht geklärt → Fehler statt Raten
@@ -523,4 +523,33 @@ test('locateInTrip: vor dem Einsteigen schon "endet vorzeitig" melden', async ()
   assert.equal(s.notBoarded, true);
   assert.equal(s.endsEarly, true);
   assert.equal(s.terminus, 'K');
+});
+
+test('forDeparture: je Variante nur die beste Verbindung im Zeitfenster nach der gewünschten Abfahrt', () => {
+  const c = (id, dep, arr, extra = {}) => ({ id, departure: NOW + dep * MIN, arrival: NOW + arr * MIN, transfers: 1, riskLevel: 'ok', cancelled: false, ...extra });
+  const r = forDeparture([c('a', 5, 60), c('b', 20, 55), c('c', 50, 70)], NOW, { maxWaitMinutes: 30 });
+  assert.deepEqual(r.connections.map((x) => x.id), ['b']); // früheste Ankunft im Fenster
+  const late = forDeparture([c('x', 150, 200)], NOW, { maxWaitMinutes: 30 });
+  assert.equal(late.connections.length, 0);
+  assert.equal(late.nextDeparture, NOW + 150 * MIN);
+  const broken = forDeparture([c('a', 5, 40, { cancelled: true }), c('b', 20, 55)], NOW, { maxWaitMinutes: 30 });
+  assert.equal(broken.connections[0].id, 'b'); // ausgefallene nur, wenn nichts anderes geht
+});
+
+test('planJourney normal: höchstens eine Verbindung je Variante; späte Varianten als "late"', async () => {
+  const { client } = createFakeClient();
+  const stops = await resolveStops(client, GEO_STOPS);
+  const { results } = await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  assert.ok(results.every((r) => r.connections.length <= 1));
+  const strict = await planJourney({ client, journey: OUTBOUND, stops, rules: { ...RULES, maxWaitMinutes: 2 }, now: NOW, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  const late = strict.results.filter((r) => r.status === 'late');
+  assert.ok(late.length > 0); // Fake fährt erst nach 5 Min. ab
+  assert.ok(late.every((r) => r.nextDeparture > NOW));
+});
+
+test('planJourney unterwegs: Alternativen bleiben erhalten (kein Zeitfenster)', async () => {
+  const { client } = createFakeClient();
+  const stops = await resolveStops(client, GEO_STOPS);
+  const { results } = await planJourney({ client, journey: OUTBOUND, stops, rules: RULES, now: NOW, start: { type: 'gps', lat: 49.25, lon: 8.52 }, weather: null, weatherThresholds: WEATHER.goodBikeWeather });
+  assert.ok(results.some((r) => r.connections.length > 1));
 });

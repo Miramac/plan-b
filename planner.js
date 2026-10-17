@@ -4,7 +4,7 @@
 import {
   pickStopMatch, buildCombinations, combinationsEnRoute, buildQueries, mergeItineraries,
   analyzeItinerary, fitsVariant, meetsMinBuffer, meetsStartBuffer, exceptionMinutes, withoutTransferReserve,
-  itineraryKey, rankConnections, weatherAt, isViaBehind, placeMatchesStop,
+  itineraryKey, rankConnections, forDeparture, weatherAt, isViaBehind, placeMatchesStop,
   nextStopOfTrip, currentTransitLeg, tokens, recentDepartures, upcomingStops, tripSequence,
 } from './logic.js';
 
@@ -29,7 +29,8 @@ import {
  *
  * @typedef {Object} ComboResult
  * @property {Combination} combo
- * @property {'ok'|'empty'|'error'} status
+ * @property {'ok'|'empty'|'error'|'late'} status   late = nur Abfahrten deutlich nach der gewünschten Zeit
+ * @property {number} [nextDeparture]              bei late: früheste Abfahrt
  * @property {string} [error]
  * @property {{variant: number, buffer: number}} [dropped]  verworfene Verbindungen (falsche Route / zu knapper Umstieg), je Fahrtenfolge gezählt
  * @property {Connection[]} connections
@@ -246,6 +247,17 @@ export async function planJourney({ client, journey, stops, rules, now, realNow 
 
   const realtimeNear = Math.abs(now - realNow) < 90 * 60_000;
   const results = await Promise.all(combos.map((combo) => runCombination({ client, combo, stops, rules, now, startInfo, realtimeNear })));
+
+  // Normale Suche: je Variante nur die beste Verbindung im Zeitfenster nach der gewünschten Abfahrt.
+  // Unterwegs bleiben alle Alternativen erhalten.
+  if (!start && rules.maxWaitMinutes != null) {
+    for (const r of results) {
+      if (r.status !== 'ok') continue;
+      const picked = forDeparture(r.connections, now, { maxWaitMinutes: rules.maxWaitMinutes, perVariant: rules.perVariant });
+      r.connections = picked.connections;
+      if (!r.connections.length) Object.assign(r, { status: 'late', nextDeparture: picked.nextDeparture });
+    }
+  }
 
   // Wetter an alle Rad-Kombinationen hängen (Zeitpunkt der Radfahrt)
   for (const r of results) {

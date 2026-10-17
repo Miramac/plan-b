@@ -747,6 +747,27 @@ export function rankConnections(list) {
   return sorted.map((c, i) => ({ ...c, best: i === 0 && !broken(c) }));
 }
 
+/**
+ * Normale Suche: Die Abfahrtszeit steht fest. Je Variante nur die beste(n) Verbindung(en), die höchstens
+ * maxWaitMinutes nach der gewünschten Abfahrt starten (früheste Ankunft, bei Gleichstand spätere Abfahrt,
+ * nicht machbare zuletzt). Wer um 7:30 los will, braucht keine Verbindung ab 10 Uhr.
+ * @param {Connection[]} connections  Verbindungen EINER Variante
+ * @param {number} departAt           gewünschte Abfahrt
+ * @param {{maxWaitMinutes: number, perVariant?: number}} opts
+ * @returns {{connections: Connection[], nextDeparture: number|null}}  nextDeparture: früheste Abfahrt, falls alle zu spät
+ */
+export function forDeparture(connections, departAt, { maxWaitMinutes, perVariant = 1 }) {
+  const broken = (c) => c.cancelled || c.riskLevel === 'missed';
+  const inWindow = connections.filter((c) => c.departure <= departAt + maxWaitMinutes * MIN);
+  const ranked = [...inWindow].sort(
+    (a, b) => Number(broken(a)) - Number(broken(b)) || a.arrival - b.arrival || b.departure - a.departure || a.transfers - b.transfers,
+  );
+  return {
+    connections: ranked.slice(0, perVariant),
+    nextDeparture: inWindow.length || !connections.length ? null : Math.min(...connections.map((c) => c.departure)),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Wetter
 // ---------------------------------------------------------------------------
